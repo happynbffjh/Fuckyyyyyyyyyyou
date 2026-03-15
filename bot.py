@@ -97,9 +97,11 @@ product_cache = {} # normalized_site -> {"data": product_info, "expires_at": epo
 bin_cache = {}     # bin -> {"data": bin_info, "expires_at": epoch}
 user_name_cache = {}  # user_id -> first_name
 mchk_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
+mchk_captcha_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
 user_active_mchk_batches = defaultdict(set)  # user_id -> set(batch_id)
 mchk_batches = {}  # batch_id -> {user_id, msg_id, status, created_at}
 cancelled_mchk_batches = set()  # batch_ids cancelled by /stopmchk
+mchk_batch_captcha_cards = defaultdict(list)  # batch_id -> list of CAPTCHA_REQUIRED cc lines
 
 # Global queues
 TASK_QUEUE = asyncio.Queue(maxsize=TASK_QUEUE_MAXSIZE)
@@ -509,6 +511,38 @@ def parse_cc_string(cc_string):
         'cvv': parts[3].strip()
     }
 
+def parse_cc_from_any_line(line):
+    """Extract and normalize CC data from mixed line formats."""
+    if not line:
+        return None
+
+    text = str(line).strip()
+    if not text:
+        return None
+
+    match = re.search(r'(\d{12,19})\D+(\d{1,2})\D+(\d{2,4})\D+(\d{3,4})', text)
+    if not match:
+        return None
+
+    cc, mm, yy, cvv = match.groups()
+    try:
+        mm_i = int(mm)
+    except ValueError:
+        return None
+    if mm_i < 1 or mm_i > 12:
+        return None
+
+    mm = f"{mm_i:02d}"
+    if len(yy) == 2:
+        yy = f"20{yy}"
+    elif len(yy) != 4:
+        return None
+
+    if len(cvv) < 3 or len(cvv) > 4:
+        return None
+
+    return f"{cc}|{mm}|{yy}|{cvv}"
+
 def get_default_bin_info(bin_number):
     return {
         "bin": bin_number,
@@ -644,6 +678,7 @@ def finalize_mchk_batch(batch_id):
     info = mchk_batches.get(batch_id)
     if not info:
         cancelled_mchk_batches.discard(batch_id)
+        mchk_batch_captcha_cards.pop(batch_id, None)
         return
     user_id = info.get('user_id')
     if user_id in user_active_mchk_batches:
@@ -652,12 +687,17 @@ def finalize_mchk_batch(batch_id):
             user_active_mchk_batches.pop(user_id, None)
     mchk_batches.pop(batch_id, None)
     cancelled_mchk_batches.discard(batch_id)
+    mchk_batch_captcha_cards.pop(batch_id, None)
 
-def cancel_user_mchk_batches(user_id):
-    """Cancel all active mchk batches for user and remove queued tasks."""
+def cancel_user_mchk_batches(user_id, batch_ids=None):
+    """Cancel mchk batches for user and remove queued tasks."""
     global pending_tasks_total
 
-    batch_ids = set(user_active_mchk_batches.get(user_id, set()))
+    active_for_user = set(user_active_mchk_batches.get(user_id, set()))
+    if batch_ids is None:
+        batch_ids = active_for_user
+    else:
+        batch_ids = set(batch_ids) & active_for_user
     if not batch_ids:
         return {'cancelled_batches': [], 'removed_pending': 0, 'msg_ids': []}
 
@@ -691,6 +731,34 @@ def cancel_user_mchk_batches(user_id):
 
     msg_ids = [mchk_batches[b]['msg_id'] for b in batch_ids if b in mchk_batches and mchk_batches[b].get('msg_id') is not None]
     return {'cancelled_batches': list(batch_ids), 'removed_pending': removed_pending, 'msg_ids': msg_ids}
+
+def add_batch_captcha_card(batch_id, cc_line):
+    """Store CAPTCHA_REQUIRED card line for batch output file."""
+    if not batch_id or not cc_line:
+        return
+    cards = mchk_batch_captcha_cards[batch_id]
+    cards.append(cc_line)
+
+async def send_batch_captcha_file(user_id, batch_id):
+    """Send CAPTCHA_REQUIRED cards as txt for finished mchk batch."""
+    cards = mchk_batch_captcha_cards.get(batch_id, [])
+    if not cards:
+        return
+
+    file_path = f"captcha_required_{user_id}_{int(time.time())}.txt"
+    try:
+        async with aiofiles.open(file_path, 'w') as f:
+            await f.write("\n".join(cards))
+        await app.send_document(
+            chat_id=user_id,
+            document=file_path,
+            caption=f"🧩 CAPTCHA_REQUIRED CCs: {len(cards)}"
+        )
+    except Exception as e:
+        logger.error(f"Error sending CAPTCHA file for batch {batch_id}: {e}")
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 def get_user_enqueue_capacity(user_id):
     """Current enqueue capacity for a user and global pool."""
@@ -1652,16 +1720,29 @@ async def update_task_progress(message_id, stats, start_time=None):
         user_id = task_users.get(message_id)
         user_name = await get_cached_user_first_name(user_id) if user_id else 'User'
         
-        # Create progress text
-        progress_text = f"""TASK
-USER: {user_name}
-START TIME: {start_time.strftime('%H:%M:%S')}
-ELAPSED: {elapsed_str}
+        duration_seconds = round(elapsed.total_seconds(), 1)
+        total_cards = stats.get('total', 0)
+        processed = stats.get('checked', 0)
+        live = stats.get('live', 0)
+        dead = stats.get('failed', 0)
+        hits = stats.get('hit', 0)
 
-CREATED BY @still_alivenow"""
+        progress_text = f"""💳 <b>CARD PROCESSOR</b>
+━━━━━━━━━━━━━━
+📂 Total Cards: {total_cards}
+📤 Processed: {processed}
+━━━━━━━━━━━━━━
+🎯 <b>RESULTS BREAKDOWN</b>
+• ✅ Live: {live}
+• ❌ Dead: {dead}
+• 💎 Hits: {hits}
+• 🧩 Captcha: {stats.get('captcha', 0)}
+━━━━━━━━━━━━━━
+⏱️ Duration: {duration_seconds}s
+👤 {user_name}"""
 
         # Create buttons
-        keyboard = InlineKeyboardMarkup([
+        keyboard_rows = [
             [
                 InlineKeyboardButton(f"TOTAL {stats.get('total', 0)}", callback_data="ignore"),
                 InlineKeyboardButton(f"CHECKED {stats.get('checked', 0)}", callback_data="ignore")
@@ -1672,9 +1753,18 @@ CREATED BY @still_alivenow"""
             ],
             [
                 InlineKeyboardButton(f"OTP {stats.get('otp', 0)}", callback_data="ignore"),
+                InlineKeyboardButton(f"CAPTCHA {stats.get('captcha', 0)}", callback_data="ignore"),
                 InlineKeyboardButton(f"FAILED {stats.get('failed', 0)}", callback_data="ignore")
             ]
-        ])
+        ]
+
+        batch_id = stats.get('batch_id')
+        if batch_id and processed < total_cards:
+            keyboard_rows.append([
+                InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
+            ])
+
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
         
         try:
             await message.edit_text(
@@ -1753,6 +1843,7 @@ async def task_worker(worker_id):
                 'task_type': task_type,
                 'task_id': task_id,
                 'mchk_show_live_otp': task.get('mchk_show_live_otp', True),
+                'mchk_send_captcha_file': task.get('mchk_send_captcha_file', True),
                 'batch_id': batch_id
             }
             
@@ -1796,6 +1887,7 @@ async def result_handler():
             task_type = result.get('task_type', 'single')
             task_id = result.get('task_id')
             mchk_show_live_otp = result.get('mchk_show_live_otp', True)
+            mchk_send_captcha_file = result.get('mchk_send_captcha_file', True)
             batch_id = result.get('batch_id')
 
             if task_type == 'mchk' and batch_id in cancelled_mchk_batches:
@@ -1814,6 +1906,10 @@ async def result_handler():
             # Check for OTP status
             elif response in ['OTP_REQUIRED', 'ACTION_REQUIRED', '2FACTOR'] or any(k in str(response) for k in twofactor_keys):
                 hit_status = "otp"
+            elif "CAPTCHA_REQUIRED" in str(response).upper():
+                hit_status = "captcha"
+                if task_type == 'mchk' and batch_id and mchk_send_captcha_file:
+                    add_batch_captcha_card(batch_id, full_cc)
             # Check for LIVE status
             elif response in ['CCN', 'INCORRECT_CVC', 'INSUFFICIENT_FUNDS'] or any(k in str(response) for k in ccn_keys):
                 hit_status = "live"
@@ -1922,6 +2018,7 @@ by @still_alivenow"""
                             'hit': 0,
                             'live': 0,
                             'otp': 0,
+                            'captcha': 0,
                             'failed': 0,
                             'start_time': datetime.now(),
                             'last_update_checked': 0,
@@ -1938,6 +2035,8 @@ by @still_alivenow"""
                         task_stats[msg_id]['live'] += 1
                     elif hit_status == 'otp':
                         task_stats[msg_id]['otp'] += 1
+                    elif hit_status == 'captcha':
+                        task_stats[msg_id]['captcha'] += 1
                     else:
                         task_stats[msg_id]['failed'] += 1
                     
@@ -1946,6 +2045,8 @@ by @still_alivenow"""
                         await update_task_progress(msg_id, task_stats[msg_id])
                     
                     if is_complete:
+                        if task_type == 'mchk' and batch_id and mchk_send_captcha_file:
+                            await send_batch_captcha_file(user_id, batch_id)
                         # Keep stats for a while then clean up
                         asyncio.create_task(cleanup_task_data(msg_id, delay=300))
                         if task_type == 'mchk' and batch_id:
@@ -2009,6 +2110,71 @@ async def handle_callback(client, callback_query: CallbackQuery):
             await callback_query.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
+        return
+
+    if data.startswith("mchk_captcha_pref:"):
+        try:
+            _, choice_token, pref_id = data.split(":", 2)
+        except ValueError:
+            await callback_query.answer("Invalid selection", show_alert=True)
+            return
+
+        session = mchk_captcha_pref_sessions.get(pref_id)
+        if not session:
+            await callback_query.answer("This selection has expired", show_alert=True)
+            return
+
+        user = callback_query.from_user
+        if not user or user.id != session.get('user_id'):
+            await callback_query.answer("This button is not for you", show_alert=True)
+            return
+
+        choice = 'yes' if choice_token == 'y' else 'no'
+        session['choice'] = choice
+        session['event'].set()
+
+        choice_text = "Yes (send CAPTCHA txt)" if choice == 'yes' else "No"
+        await callback_query.answer(f"Selected: {choice_text}")
+
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    if data.startswith("stopmchk_batch:"):
+        batch_id = data.split(":", 1)[1].strip()
+        user = callback_query.from_user
+        if not user:
+            await callback_query.answer("User not found", show_alert=True)
+            return
+
+        cancel_info = cancel_user_mchk_batches(user.id, batch_ids=[batch_id])
+        cancelled_batches = cancel_info.get('cancelled_batches', [])
+        removed_pending = cancel_info.get('removed_pending', 0)
+        msg_ids = set(cancel_info.get('msg_ids', []))
+
+        if not cancelled_batches:
+            await callback_query.answer("Batch already stopped or finished", show_alert=True)
+            return
+
+        for msg_id in msg_ids:
+            progress_msg = task_messages.get(msg_id)
+            if not progress_msg:
+                continue
+            stats = task_stats.get(msg_id, {})
+            checked = stats.get('checked', 0)
+            total = stats.get('total', 0)
+            try:
+                await progress_msg.edit_text(
+                    f"⛔ MASS CHECK STOPPED\n\nChecked: {checked}/{total}\nPending removed: {removed_pending}",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
+            asyncio.create_task(cleanup_task_data(msg_id, delay=10))
+
+        await callback_query.answer(f"Stopped batch. Removed pending: {removed_pending}")
         return
 
     await callback_query.answer()  # Just acknowledge the callback
@@ -2404,6 +2570,7 @@ I'm a Shopify Credit Card Checker Bot. Here are my commands:
 🔹 <b>Mass Check</b>
 /mchk - Send up to {MAX_MASS_CHECK_CARDS} cards (one per line) or reply to a .txt file
 /stopmchk - Stop your current mass check batch
+/clean - Reply to a txt/message to clean CCs (one per line output txt)
 
 🔹 <b>Site Checker</b>
 /chksite - Test sites and get working ones (reply to .txt file with sites)
@@ -2613,27 +2780,83 @@ async def mchk_command(client, message):
         )
     except Exception:
         pass
-    
-    # Create progress message
-    progress_text = f"""TASK
-USER: {user.first_name}
-START TIME: {datetime.now().strftime('%H:%M:%S')}
-ELAPSED: 0:00:00
 
-CREATED BY @still_alivenow"""
+    # Ask user whether to send CAPTCHA_REQUIRED cards as txt after completion
+    captcha_pref_id = hashlib.md5(
+        f"captcha:{user.id}:{time.time_ns()}:{random.random()}".encode()
+    ).hexdigest()[:12]
+    captcha_pref_event = asyncio.Event()
+    mchk_captcha_pref_sessions[captcha_pref_id] = {
+        'user_id': user.id,
+        'choice': None,
+        'event': captcha_pref_event,
+        'created_at': time.time()
+    }
+
+    captcha_pref_text = (
+        "Send CAPTCHA_REQUIRED cards as txt file when mass check completes?"
+    )
+    captcha_pref_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes", callback_data=f"mchk_captcha_pref:y:{captcha_pref_id}")],
+        [InlineKeyboardButton("No", callback_data=f"mchk_captcha_pref:n:{captcha_pref_id}")]
+    ])
+    captcha_pref_message = await message.reply_text(
+        captcha_pref_text,
+        reply_markup=captcha_pref_keyboard,
+        disable_web_page_preview=True
+    )
+
+    send_captcha_file = True
+    try:
+        await asyncio.wait_for(captcha_pref_event.wait(), timeout=45)
+        captcha_choice = mchk_captcha_pref_sessions.get(captcha_pref_id, {}).get('choice', 'yes')
+        send_captcha_file = captcha_choice == 'yes'
+    except asyncio.TimeoutError:
+        send_captcha_file = True
+    finally:
+        mchk_captcha_pref_sessions.pop(captcha_pref_id, None)
+
+    try:
+        await captcha_pref_message.edit_text(
+            f"{captcha_pref_text}\n\n✅ Selected: {'Yes' if send_captcha_file else 'No'}",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        pass
+    
+    batch_id = f"mchk_{user.id}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+
+    # Create progress message
+    progress_text = f"""💳 <b>CARD PROCESSOR</b>
+━━━━━━━━━━━━━━
+📂 Total Cards: {len(accepted_cards)}
+📤 Processed: 0
+━━━━━━━━━━━━━━
+🎯 <b>RESULTS BREAKDOWN</b>
+• ✅ Live: 0
+• ❌ Dead: 0
+• 💎 Hits: 0
+• 🧩 Captcha: 0
+━━━━━━━━━━━━━━
+⏱️ Duration: 0.0s
+👤 {user.first_name}"""
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(f"TOTAL {len(accepted_cards)}", callback_data="ignore"),
-            InlineKeyboardButton(f"CHECKED 0", callback_data="ignore")
+            InlineKeyboardButton("CHECKED 0", callback_data="ignore")
         ],
         [
-            InlineKeyboardButton(f"HIT 0", callback_data="ignore"),
-            InlineKeyboardButton(f"LIVE 0", callback_data="ignore")
+            InlineKeyboardButton("HIT 0", callback_data="ignore"),
+            InlineKeyboardButton("LIVE 0", callback_data="ignore")
         ],
         [
-            InlineKeyboardButton(f"OTP 0", callback_data="ignore"),
-            InlineKeyboardButton(f"FAILED 0", callback_data="ignore")
+            InlineKeyboardButton("OTP 0", callback_data="ignore"),
+            InlineKeyboardButton("CAPTCHA 0", callback_data="ignore"),
+            InlineKeyboardButton("FAILED 0", callback_data="ignore")
+        ],
+        [
+            InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
         ]
     ])
     
@@ -2643,8 +2866,6 @@ CREATED BY @still_alivenow"""
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
     )
-    
-    batch_id = f"mchk_{user.id}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
     # Store task info
     msg_id = processing_msg.id
@@ -2654,11 +2875,14 @@ CREATED BY @still_alivenow"""
         'hit': 0,
         'live': 0,
         'otp': 0,
+        'captcha': 0,
         'failed': 0,
         'start_time': datetime.now(),
         'last_update_checked': 0,
         'last_update_at': 0.0,
-        'batch_id': batch_id
+        'batch_id': batch_id,
+        'task_type': 'mchk',
+        'mchk_send_captcha_file': send_captcha_file
     }
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
@@ -2680,6 +2904,7 @@ CREATED BY @still_alivenow"""
             'type': 'mchk',
             'task_id': task_id,
             'mchk_show_live_otp': send_live_otp,
+            'mchk_send_captcha_file': send_captcha_file,
             'batch_id': batch_id
         })
         if not queued_ok:
@@ -2711,6 +2936,64 @@ CREATED BY @still_alivenow"""
             f"⚠️ Queue limit reached. Accepted: {queued_cards} | Skipped: {dropped_for_capacity}",
             disable_web_page_preview=True
         )
+
+@app.on_message(filters.command('clean') & filters.private)
+async def clean_command(client, message):
+    """Clean CC lines from replied text/txt and return normalized txt."""
+    user = message.from_user
+    await save_user(user.id, user.first_name, user.username)
+
+    lines = []
+    tmp_file = None
+    try:
+        if message.reply_to_message:
+            if message.reply_to_message.document:
+                tmp_file = await message.reply_to_message.download()
+                async with aiofiles.open(tmp_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = await f.read()
+                lines = content.splitlines()
+            elif message.reply_to_message.text:
+                lines = message.reply_to_message.text.splitlines()
+        elif len(message.command) > 1:
+            lines = ' '.join(message.command[1:]).splitlines()
+
+        if not lines:
+            await message.reply_text(
+                "❌ Reply to a .txt file or text containing CCs.\nExample: 4111111111111111|12|2028|123",
+                disable_web_page_preview=True
+            )
+            return
+
+        cleaned = []
+        seen = set()
+        invalid = 0
+        for line in lines:
+            normalized = parse_cc_from_any_line(line)
+            if not normalized:
+                invalid += 1
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            cleaned.append(normalized)
+
+        if not cleaned:
+            await message.reply_text("❌ No valid CC lines found to clean.", disable_web_page_preview=True)
+            return
+
+        output_file = f"cleaned_ccs_{user.id}_{int(time.time())}.txt"
+        async with aiofiles.open(output_file, 'w') as f:
+            await f.write('\n'.join(cleaned))
+
+        await message.reply_document(
+            output_file,
+            caption=f"✅ Clean complete\nValid: {len(cleaned)}\nInvalid: {invalid}\nDuplicates removed: {max(0, len(lines)-len(cleaned)-invalid)}",
+            disable_web_page_preview=True
+        )
+        os.remove(output_file)
+    finally:
+        if tmp_file and os.path.exists(tmp_file):
+            os.remove(tmp_file)
 
 @app.on_message(filters.command('stopmchk') & filters.private)
 async def stopmchk_command(client, message):
@@ -2824,10 +3107,12 @@ CREATED BY @still_alivenow"""
         'hit': 0,
         'live': 0,
         'otp': 0,
+        'captcha': 0,
         'failed': 0,
         'start_time': datetime.now(),
         'last_update_checked': 0,
-        'last_update_at': 0.0
+        'last_update_at': 0.0,
+        'task_type': 'chksite'
     }
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
