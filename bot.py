@@ -10,7 +10,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 from pyrogram.enums import ParseMode
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import threading
 from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,7 +32,10 @@ BOT_TOKEN = "8435065448:AAF3deY52T_TRETXKPgZnqOaqyfHXzUVlZ4"
 API_ID = 23933044
 API_HASH = "6df11147cbec7d62a323f0f498c8c03a"
 ADMINS = [7125341830]
-MONGO_URL = "mongodb+srv://animepahe:animepahe@animepahe.o8zgy.mongodb.net/?retryWrites=true&w=majority"
+MONGO_URL = os.getenv(
+    "MONGO_URL",
+    "mongodb+srv://animepahe:animepahe@animepahe.o8zgy.mongodb.net/?retryWrites=true&w=majority"
+)
 HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
 
 # Constants
@@ -75,6 +78,14 @@ users_col = db['users']
 proxies_col = db['proxies']
 sites_col = db['sites']
 user_sites_col = db['user_sites']
+DB_AVAILABLE = True
+DB_ERROR_REASON = None
+
+# In-memory persistence fallback (used when MongoDB is unavailable)
+mem_users = {}                  # user_id -> user dict
+mem_user_proxies = defaultdict(set)   # user_id -> set(proxy)
+mem_user_sites = defaultdict(list)    # user_id -> list(site_entry)
+mem_global_sites = set()              # set(site_url)
 
 # In-memory task tracking
 active_tasks = {}  # legacy map kept for compatibility
@@ -578,6 +589,39 @@ def get_active_task_stats(user_id):
         "active_processing": processing
     }
 
+def utcnow():
+    return datetime.now(timezone.utc)
+
+def set_db_unavailable(error):
+    """Switch to memory fallback when DB is unreachable."""
+    global DB_AVAILABLE, DB_ERROR_REASON
+    DB_AVAILABLE = False
+    DB_ERROR_REASON = str(error)
+
+def get_memory_user_doc(user_id):
+    user = mem_users.get(user_id)
+    if not user:
+        return None
+    return dict(user)
+
+def get_memory_site_doc(user_id):
+    sites = mem_user_sites.get(user_id, [])
+    if not sites:
+        return None
+    normalized = []
+    for entry in sites:
+        normalized.append(dict(entry) if isinstance(entry, dict) else entry)
+    return {'user_id': user_id, 'sites': normalized}
+
+def get_memory_all_user_site_docs():
+    docs = []
+    for uid, sites in mem_user_sites.items():
+        normalized = []
+        for entry in sites:
+            normalized.append(dict(entry) if isinstance(entry, dict) else entry)
+        docs.append({'user_id': uid, 'sites': normalized})
+    return docs
+
 def remove_user_from_round_robin(user_id):
     if user_id not in pending_users_set:
         return
@@ -730,8 +774,18 @@ async def get_cached_user_first_name(user_id):
     cached_name = user_name_cache.get(user_id)
     if cached_name:
         return cached_name
-    user = await users_col.find_one({'user_id': user_id})
-    first_name = user.get('first_name', 'User') if user else 'User'
+    first_name = 'User'
+    if DB_AVAILABLE:
+        try:
+            user = await users_col.find_one({'user_id': user_id})
+            first_name = user.get('first_name', 'User') if user else 'User'
+        except Exception as e:
+            set_db_unavailable(e)
+            user = get_memory_user_doc(user_id)
+            first_name = user.get('first_name', 'User') if user else 'User'
+    else:
+        user = get_memory_user_doc(user_id)
+        first_name = user.get('first_name', 'User') if user else 'User'
     user_name_cache[user_id] = first_name
     return first_name
 
@@ -1495,10 +1549,22 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
 async def remove_dead_site(user_id, site_url):
     """Remove dead site from user's sites"""
     try:
-        await user_sites_col.update_one(
-            {'user_id': user_id},
-            {'$pull': {'sites': {'url': site_url}}}
-        )
+        site_url = normalize_site_url(site_url)
+        if DB_AVAILABLE:
+            try:
+                await user_sites_col.update_one(
+                    {'user_id': user_id},
+                    {'$pull': {'sites': {'url': site_url}}}
+                )
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+        if user_id in mem_user_sites:
+            mem_user_sites[user_id] = [
+                s for s in mem_user_sites[user_id]
+                if not (isinstance(s, dict) and s.get('url') == site_url)
+            ]
+            if not mem_user_sites[user_id]:
+                mem_user_sites.pop(user_id, None)
     except Exception as e:
         logger.error(f"Error removing dead site: {e}")
 
@@ -1515,7 +1581,16 @@ async def save_working_site(user_id, site_url, product_info):
             return False, f"Cheapest product ${product_price:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
 
         # Check if user already has max sites
-        user_sites_doc = await user_sites_col.find_one({'user_id': user_id})
+        user_sites_doc = None
+        if DB_AVAILABLE:
+            try:
+                user_sites_doc = await user_sites_col.find_one({'user_id': user_id})
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+                user_sites_doc = get_memory_site_doc(user_id)
+        else:
+            user_sites_doc = get_memory_site_doc(user_id)
+
         current_count = len(user_sites_doc.get('sites', [])) if user_sites_doc else 0
         
         if current_count >= MAX_SITES_PER_USER:
@@ -1533,18 +1608,27 @@ async def save_working_site(user_id, site_url, product_info):
             'price': f"{product_price:.2f}",
             'variant_id': product_info.get('variant_id'),
             'product_link': product_info.get('link'),
-            'last_checked': datetime.utcnow()
+            'last_checked': utcnow()
         }
-        
-        await user_sites_col.update_one(
-            {'user_id': user_id},
-            {
-                '$addToSet': {
-                    'sites': site_entry
-                }
-            },
-            upsert=True
-        )
+
+        if DB_AVAILABLE:
+            try:
+                await user_sites_col.update_one(
+                    {'user_id': user_id},
+                    {
+                        '$addToSet': {
+                            'sites': site_entry
+                        }
+                    },
+                    upsert=True
+                )
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+
+        # Always mirror in memory so fallback remains consistent.
+        user_sites = mem_user_sites[user_id]
+        if site_url not in [(s.get('url') if isinstance(s, dict) else str(s)) for s in user_sites]:
+            user_sites.append(site_entry)
         return True, "Site added successfully"
     except Exception as e:
         logger.error(f"Error saving working site: {e}")
@@ -1932,6 +2016,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
 # Database functions
 async def init_db():
     """Initialize database collections and indexes"""
+    global DB_AVAILABLE
     try:
         # Users collection indexes
         await users_col.create_index('user_id', unique=True)
@@ -1946,23 +2031,39 @@ async def init_db():
         await user_sites_col.create_index([('user_id', 1), ('sites.url', 1)])
         
         logger.info("Database initialized successfully")
+        DB_AVAILABLE = True
     except Exception as e:
+        set_db_unavailable(e)
         logger.error(f"Database initialization error: {e}")
+        logger.warning("Running with in-memory fallback storage (data will not persist across restarts).")
 
 async def get_user_proxies(user_id):
     """Get all proxies for a user"""
-    cursor = proxies_col.find({'user_id': user_id})
-    proxies = await cursor.to_list(length=None)
-    return [p['proxy'] for p in proxies]
+    if DB_AVAILABLE:
+        try:
+            cursor = proxies_col.find({'user_id': user_id})
+            proxies = await cursor.to_list(length=None)
+            proxy_values = [p['proxy'] for p in proxies if p.get('proxy')]
+            if proxy_values:
+                mem_user_proxies[user_id].update(proxy_values)
+            return proxy_values
+        except Exception as e:
+            set_db_unavailable(e)
+    return list(mem_user_proxies.get(user_id, set()))
 
 async def add_user_proxy(user_id, proxy):
     """Add a proxy for a user"""
     try:
-        await proxies_col.update_one(
-            {'user_id': user_id, 'proxy': proxy},
-            {'$set': {'user_id': user_id, 'proxy': proxy, 'added_at': datetime.utcnow()}},
-            upsert=True
-        )
+        if DB_AVAILABLE:
+            try:
+                await proxies_col.update_one(
+                    {'user_id': user_id, 'proxy': proxy},
+                    {'$set': {'user_id': user_id, 'proxy': proxy, 'added_at': utcnow()}},
+                    upsert=True
+                )
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+        mem_user_proxies[user_id].add(proxy)
         return True
     except Exception as e:
         logger.error(f"Error adding proxy: {e}")
@@ -1972,47 +2073,163 @@ async def delete_user_proxy(user_id, proxy=None):
     """Delete proxy(s) for a user"""
     try:
         if proxy:
-            result = await proxies_col.delete_one({'user_id': user_id, 'proxy': proxy})
-            return result.deleted_count > 0
+            deleted = False
+            if DB_AVAILABLE:
+                try:
+                    result = await proxies_col.delete_one({'user_id': user_id, 'proxy': proxy})
+                    deleted = result.deleted_count > 0
+                except Exception as db_error:
+                    set_db_unavailable(db_error)
+            if proxy in mem_user_proxies.get(user_id, set()):
+                mem_user_proxies[user_id].discard(proxy)
+                deleted = True
+            if user_id in mem_user_proxies and not mem_user_proxies[user_id]:
+                mem_user_proxies.pop(user_id, None)
+            return deleted
         else:
-            result = await proxies_col.delete_many({'user_id': user_id})
-            return result.deleted_count > 0
+            deleted = False
+            if DB_AVAILABLE:
+                try:
+                    result = await proxies_col.delete_many({'user_id': user_id})
+                    deleted = result.deleted_count > 0
+                except Exception as db_error:
+                    set_db_unavailable(db_error)
+            if user_id in mem_user_proxies and mem_user_proxies[user_id]:
+                deleted = True
+            mem_user_proxies.pop(user_id, None)
+            return deleted
     except Exception as e:
         logger.error(f"Error deleting proxy: {e}")
         return False
 
 async def get_all_proxies():
     """Get all proxies from all users"""
-    cursor = proxies_col.find({})
-    proxies = await cursor.to_list(length=None)
-    return proxies
+    if DB_AVAILABLE:
+        try:
+            cursor = proxies_col.find({})
+            proxies = await cursor.to_list(length=None)
+            for p in proxies:
+                uid = p.get('user_id')
+                proxy = p.get('proxy')
+                if uid is not None and proxy:
+                    mem_user_proxies[uid].add(proxy)
+            return proxies
+        except Exception as e:
+            set_db_unavailable(e)
+
+    all_proxies = []
+    for uid, proxy_set in mem_user_proxies.items():
+        for proxy in proxy_set:
+            all_proxies.append({'user_id': uid, 'proxy': proxy})
+    return all_proxies
 
 async def get_user_sites(user_id):
     """Get all working sites for a user"""
-    user_sites = await user_sites_col.find_one({'user_id': user_id})
-    if user_sites and 'sites' in user_sites:
-        return [site['url'] if isinstance(site, dict) else site for site in user_sites['sites']]
+    if DB_AVAILABLE:
+        try:
+            user_sites = await user_sites_col.find_one({'user_id': user_id})
+            if user_sites and 'sites' in user_sites:
+                mem_user_sites[user_id] = [
+                    dict(site) if isinstance(site, dict) else {'url': str(site)}
+                    for site in user_sites['sites']
+                ]
+                return [site['url'] if isinstance(site, dict) else site for site in user_sites['sites']]
+        except Exception as e:
+            set_db_unavailable(e)
+
+    user_sites = mem_user_sites.get(user_id, [])
+    if user_sites:
+        return [site['url'] if isinstance(site, dict) else site for site in user_sites]
     return []
+
+async def get_user_sites_doc(user_id):
+    """Get full user sites doc, with memory fallback."""
+    if DB_AVAILABLE:
+        try:
+            user_sites = await user_sites_col.find_one({'user_id': user_id})
+            if user_sites and 'sites' in user_sites:
+                mem_user_sites[user_id] = [
+                    dict(site) if isinstance(site, dict) else {'url': str(site)}
+                    for site in user_sites.get('sites', [])
+                ]
+                return user_sites
+        except Exception as e:
+            set_db_unavailable(e)
+    return get_memory_site_doc(user_id)
+
+async def replace_user_sites(user_id, sites):
+    """Replace user sites list in storage."""
+    normalized_sites = [dict(site) if isinstance(site, dict) else {'url': str(site)} for site in sites]
+    mem_user_sites[user_id] = normalized_sites
+    if DB_AVAILABLE:
+        try:
+            await user_sites_col.update_one(
+                {'user_id': user_id},
+                {'$set': {'user_id': user_id, 'sites': normalized_sites}},
+                upsert=True
+            )
+        except Exception as e:
+            set_db_unavailable(e)
+
+async def get_all_user_site_docs():
+    """Get all user site docs."""
+    if DB_AVAILABLE:
+        try:
+            cursor = user_sites_col.find({})
+            docs = await cursor.to_list(length=None)
+            for doc in docs:
+                uid = doc.get('user_id')
+                if uid is None:
+                    continue
+                mem_user_sites[uid] = [
+                    dict(site) if isinstance(site, dict) else {'url': str(site)}
+                    for site in doc.get('sites', [])
+                ]
+            return docs
+        except Exception as e:
+            set_db_unavailable(e)
+    return get_memory_all_user_site_docs()
 
 async def get_all_sites():
     """Get all global sites"""
-    cursor = sites_col.find({})
-    sites = await cursor.to_list(length=None)
-    return [s['url'] for s in sites]
+    if DB_AVAILABLE:
+        try:
+            cursor = sites_col.find({})
+            sites = await cursor.to_list(length=None)
+            urls = [s['url'] for s in sites if s.get('url')]
+            if urls:
+                mem_global_sites.update(urls)
+            return urls
+        except Exception as e:
+            set_db_unavailable(e)
+    return list(mem_global_sites)
 
 async def add_global_site(site_url):
     """Add a site to global sites"""
     try:
+        site_url = normalize_site_url(site_url)
         # Check global site limit
-        current_count = await sites_col.count_documents({})
+        current_count = len(mem_global_sites)
+        if DB_AVAILABLE:
+            try:
+                current_count = await sites_col.count_documents({})
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+
         if current_count >= MAX_GLOBAL_SITES:
             return False, f"Maximum global site limit reached ({MAX_GLOBAL_SITES})"
-        
-        await sites_col.update_one(
-            {'url': site_url},
-            {'$set': {'url': site_url, 'added_at': datetime.utcnow()}},
-            upsert=True
-        )
+
+        if DB_AVAILABLE:
+            try:
+                await sites_col.update_one(
+                    {'url': site_url},
+                    {'$set': {'url': site_url, 'added_at': utcnow()}},
+                    upsert=True
+                )
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+
+        mem_global_sites.add(site_url)
         return True, "Site added successfully"
     except Exception as e:
         logger.error(f"Error adding global site: {e}")
@@ -2022,11 +2239,30 @@ async def delete_global_site(site_url=None):
     """Delete global site(s)"""
     try:
         if site_url:
-            result = await sites_col.delete_one({'url': site_url})
-            return result.deleted_count > 0
+            site_url = normalize_site_url(site_url)
+            deleted = False
+            if DB_AVAILABLE:
+                try:
+                    result = await sites_col.delete_one({'url': site_url})
+                    deleted = result.deleted_count > 0
+                except Exception as db_error:
+                    set_db_unavailable(db_error)
+            if site_url in mem_global_sites:
+                mem_global_sites.discard(site_url)
+                deleted = True
+            return deleted
         else:
-            result = await sites_col.delete_many({})
-            return result.deleted_count > 0
+            deleted = False
+            if DB_AVAILABLE:
+                try:
+                    result = await sites_col.delete_many({})
+                    deleted = result.deleted_count > 0
+                except Exception as db_error:
+                    set_db_unavailable(db_error)
+            if mem_global_sites:
+                deleted = True
+            mem_global_sites.clear()
+            return deleted
     except Exception as e:
         logger.error(f"Error deleting global site: {e}")
         return False
@@ -2047,36 +2283,60 @@ async def get_random_site(user_id):
 
 async def save_user(user_id, first_name, username=None):
     """Save or update user in database"""
+    user_name_cache[user_id] = first_name
+    now_ts = utcnow()
+    existing_mem = mem_users.get(user_id, {})
+    mem_users[user_id] = {
+        'user_id': user_id,
+        'first_name': first_name,
+        'username': username,
+        'last_seen': now_ts,
+        'joined_at': existing_mem.get('joined_at', now_ts),
+        'total_checks': existing_mem.get('total_checks', 0)
+    }
+
     try:
-        await users_col.update_one(
-            {'user_id': user_id},
-            {
-                '$set': {
-                    'first_name': first_name,
-                    'username': username,
-                    'last_seen': datetime.utcnow()
+        if DB_AVAILABLE:
+            await users_col.update_one(
+                {'user_id': user_id},
+                {
+                    '$set': {
+                        'first_name': first_name,
+                        'username': username,
+                        'last_seen': now_ts
+                    },
+                    '$setOnInsert': {
+                        'joined_at': now_ts,
+                        'total_checks': 0
+                    }
                 },
-                '$setOnInsert': {
-                    'joined_at': datetime.utcnow(),
-                    'total_checks': 0
-                }
-            },
-            upsert=True
-        )
-        user_name_cache[user_id] = first_name
+                upsert=True
+            )
     except Exception as e:
+        set_db_unavailable(e)
         logger.error(f"Error saving user: {e}")
 
 async def increment_user_checks_bulk(user_id, amount):
     """Increment user's total checks count by amount."""
     if amount <= 0:
         return
+    mem_users.setdefault(user_id, {
+        'user_id': user_id,
+        'first_name': user_name_cache.get(user_id, 'User'),
+        'username': None,
+        'joined_at': utcnow(),
+        'last_seen': utcnow(),
+        'total_checks': 0
+    })
+    mem_users[user_id]['total_checks'] = mem_users[user_id].get('total_checks', 0) + amount
     try:
-        await users_col.update_one(
-            {'user_id': user_id},
-            {'$inc': {'total_checks': amount}}
-        )
+        if DB_AVAILABLE:
+            await users_col.update_one(
+                {'user_id': user_id},
+                {'$inc': {'total_checks': amount}}
+            )
     except Exception as e:
+        set_db_unavailable(e)
         logger.error(f"Error incrementing user checks by {amount}: {e}")
 
 async def increment_user_checks(user_id):
@@ -2085,12 +2345,32 @@ async def increment_user_checks(user_id):
 
 async def get_user_stats(user_id):
     """Get user statistics"""
-    user = await users_col.find_one({'user_id': user_id})
+    user = None
+    proxy_count = len(mem_user_proxies.get(user_id, set()))
+    sites_count = len(mem_user_sites.get(user_id, []))
+
+    if DB_AVAILABLE:
+        try:
+            user = await users_col.find_one({'user_id': user_id})
+            if user:
+                mem_users[user_id] = {
+                    'user_id': user_id,
+                    'first_name': user.get('first_name', 'Unknown'),
+                    'username': user.get('username'),
+                    'joined_at': user.get('joined_at'),
+                    'last_seen': user.get('last_seen'),
+                    'total_checks': user.get('total_checks', 0)
+                }
+            proxy_count = await proxies_col.count_documents({'user_id': user_id})
+            sites_count = len(await get_user_sites(user_id))
+        except Exception as e:
+            set_db_unavailable(e)
+
+    if not user:
+        user = get_memory_user_doc(user_id)
     if not user:
         return None
-    
-    proxy_count = await proxies_col.count_documents({'user_id': user_id})
-    sites_count = len(await get_user_sites(user_id))
+
     active_task_stats = get_active_task_stats(user_id)
     
     return {
@@ -2818,7 +3098,7 @@ async def showsites_command(client, message):
     user = message.from_user
     
     # Get user's sites
-    user_sites_doc = await user_sites_col.find_one({'user_id': user.id})
+    user_sites_doc = await get_user_sites_doc(user.id)
     
     if not user_sites_doc or 'sites' not in user_sites_doc or not user_sites_doc['sites']:
         await message.reply_text("❌ You don't have any saved sites yet.\nUse /addsite to add working sites first.", disable_web_page_preview=True)
@@ -2882,7 +3162,7 @@ async def rmvsite_command(client, message):
     args = message.text.split()
     
     # Get user's sites first
-    user_sites_doc = await user_sites_col.find_one({'user_id': user.id})
+    user_sites_doc = await get_user_sites_doc(user.id)
     
     if not user_sites_doc or 'sites' not in user_sites_doc or not user_sites_doc['sites']:
         await message.reply_text("❌ You don't have any saved sites yet.\nUse /addsite to add working sites first.", disable_web_page_preview=True)
@@ -2916,10 +3196,11 @@ async def rmvsite_command(client, message):
     
     # Case 1: Remove all sites
     if removal_input == 'all':
-        # Delete all sites immediately
-        result = await user_sites_col.delete_one({'user_id': user.id})
-        
-        if result.deleted_count > 0:
+        sites_list = user_sites_doc.get('sites', [])
+        had_sites = bool(sites_list)
+        await replace_user_sites(user.id, [])
+
+        if had_sites:
             await message.reply_text("✅ All your working sites have been removed successfully!", disable_web_page_preview=True)
         else:
             await message.reply_text("❌ Failed to remove sites or no sites found.", disable_web_page_preview=True)
@@ -2941,12 +3222,10 @@ async def rmvsite_command(client, message):
                 site_url = site_to_remove
             
             # Remove the site
-            result = await user_sites_col.update_one(
-                {'user_id': user.id},
-                {'$pull': {'sites': site_to_remove}}
-            )
-            
-            if result.modified_count > 0:
+            new_sites = [s for idx, s in enumerate(sites_list) if idx != site_number]
+            await replace_user_sites(user.id, new_sites)
+
+            if len(new_sites) != len(sites_list):
                 await message.reply_text(
                     f"✅ Site removed successfully!\n\n"
                     f"Removed: {site_url if isinstance(site_url, str) else 'Unknown'}\n"
@@ -2983,13 +3262,11 @@ async def rmvsite_command(client, message):
         if len(matching_sites) == 1:
             # Single match - remove it directly
             site_to_remove = matching_sites[0]
-            
-            result = await user_sites_col.update_one(
-                {'user_id': user.id},
-                {'$pull': {'sites': site_to_remove}}
-            )
-            
-            if result.modified_count > 0:
+
+            new_sites = [s for s in sites_list if s != site_to_remove]
+            await replace_user_sites(user.id, new_sites)
+
+            if len(new_sites) != len(sites_list):
                 site_name = site_to_remove.get('url', str(site_to_remove)) if isinstance(site_to_remove, dict) else str(site_to_remove)
                 await message.reply_text(f"✅ Site removed: {site_name}", disable_web_page_preview=True)
             else:
@@ -3117,8 +3394,7 @@ async def getusersite_command(client, message):
         return
     
     # Get all user sites
-    cursor = user_sites_col.find({})
-    user_sites_list = await cursor.to_list(length=None)
+    user_sites_list = await get_all_user_site_docs()
     
     if not user_sites_list:
         await message.reply_text("❌ No user sites found", disable_web_page_preview=True)
