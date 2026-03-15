@@ -41,7 +41,8 @@ HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
 # Constants
 MAX_SITES_PER_USER = 500
 MAX_GLOBAL_SITES = 500
-MAX_SITE_PRODUCT_PRICE = 20.00
+MIN_SITE_PRODUCT_PRICE = 1.00
+MAX_SITE_PRODUCT_PRICE = 26.00
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "60"))
 PROXY_VALIDATION_URL = "https://httpbin.org/ip"
 PROXY_VALIDATION_TIMEOUT = 6
@@ -656,6 +657,36 @@ def get_memory_all_user_site_docs():
             normalized.append(dict(entry) if isinstance(entry, dict) else entry)
         docs.append({'user_id': uid, 'sites': normalized})
     return docs
+
+def filter_sites_by_price_range(sites):
+    """Keep only site entries with price in configured range."""
+    filtered = []
+    removed = 0
+    for entry in sites or []:
+        if not isinstance(entry, dict):
+            removed += 1
+            continue
+
+        url = entry.get('url')
+        if not url:
+            removed += 1
+            continue
+
+        try:
+            price = float(str(entry.get('price', '')).replace(',', '').strip())
+        except Exception:
+            removed += 1
+            continue
+
+        if price < MIN_SITE_PRODUCT_PRICE or price > MAX_SITE_PRODUCT_PRICE:
+            removed += 1
+            continue
+
+        normalized_entry = dict(entry)
+        normalized_entry['url'] = normalize_site_url(url)
+        normalized_entry['price'] = f"{price:.2f}"
+        filtered.append(normalized_entry)
+    return filtered, removed
 
 def remove_user_from_round_robin(user_id):
     if user_id not in pending_users_set:
@@ -1646,6 +1677,9 @@ async def save_working_site(user_id, site_url, product_info):
         except Exception:
             return False, "Invalid product price"
 
+        if product_price < MIN_SITE_PRODUCT_PRICE:
+            return False, f"Cheapest product ${product_price:.2f} is below ${MIN_SITE_PRODUCT_PRICE:.2f}"
+
         if product_price > MAX_SITE_PRODUCT_PRICE:
             return False, f"Cheapest product ${product_price:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
 
@@ -2292,37 +2326,65 @@ async def get_all_proxies():
 
 async def get_user_sites(user_id):
     """Get all working sites for a user"""
+    user_sites = None
     if DB_AVAILABLE:
         try:
             user_sites = await user_sites_col.find_one({'user_id': user_id})
-            if user_sites and 'sites' in user_sites:
-                mem_user_sites[user_id] = [
-                    dict(site) if isinstance(site, dict) else {'url': str(site)}
-                    for site in user_sites['sites']
-                ]
-                return [site['url'] if isinstance(site, dict) else site for site in user_sites['sites']]
+        except Exception as e:
+            set_db_unavailable(e)
+            user_sites = None
+
+    if user_sites and 'sites' in user_sites:
+        raw_sites = [dict(site) if isinstance(site, dict) else {'url': str(site)} for site in user_sites.get('sites', [])]
+    else:
+        raw_sites = mem_user_sites.get(user_id, [])
+
+    filtered_sites, removed_count = filter_sites_by_price_range(raw_sites)
+    mem_user_sites[user_id] = filtered_sites
+
+    if removed_count > 0 and DB_AVAILABLE:
+        try:
+            await user_sites_col.update_one(
+                {'user_id': user_id},
+                {'$set': {'user_id': user_id, 'sites': filtered_sites}},
+                upsert=True
+            )
         except Exception as e:
             set_db_unavailable(e)
 
-    user_sites = mem_user_sites.get(user_id, [])
-    if user_sites:
-        return [site['url'] if isinstance(site, dict) else site for site in user_sites]
-    return []
+    return [site.get('url') for site in filtered_sites if site.get('url')]
 
 async def get_user_sites_doc(user_id):
     """Get full user sites doc, with memory fallback."""
+    user_sites = None
     if DB_AVAILABLE:
         try:
             user_sites = await user_sites_col.find_one({'user_id': user_id})
-            if user_sites and 'sites' in user_sites:
-                mem_user_sites[user_id] = [
-                    dict(site) if isinstance(site, dict) else {'url': str(site)}
-                    for site in user_sites.get('sites', [])
-                ]
-                return user_sites
         except Exception as e:
             set_db_unavailable(e)
-    return get_memory_site_doc(user_id)
+            user_sites = None
+
+    if user_sites and 'sites' in user_sites:
+        raw_sites = [dict(site) if isinstance(site, dict) else {'url': str(site)} for site in user_sites.get('sites', [])]
+    else:
+        raw_sites = mem_user_sites.get(user_id, [])
+
+    filtered_sites, removed_count = filter_sites_by_price_range(raw_sites)
+    mem_user_sites[user_id] = filtered_sites
+
+    if removed_count > 0 and DB_AVAILABLE:
+        try:
+            await user_sites_col.update_one(
+                {'user_id': user_id},
+                {'$set': {'user_id': user_id, 'sites': filtered_sites}},
+                upsert=True
+            )
+        except Exception as e:
+            set_db_unavailable(e)
+
+    if not filtered_sites:
+        return None
+    return {'user_id': user_id, 'sites': filtered_sites}
 
 async def replace_user_sites(user_id, sites):
     """Replace user sites list in storage."""
@@ -3186,10 +3248,10 @@ CREATED BY @still_alivenow"""
 
 📊 Results:
 🟢 Added: {len(working_sites)}
-🟡 Skipped (> ${MAX_SITE_PRODUCT_PRICE:.2f}): {len(skipped_sites)}
+🟡 Skipped (outside ${MIN_SITE_PRODUCT_PRICE:.2f}-${MAX_SITE_PRODUCT_PRICE:.2f}): {len(skipped_sites)}
 🔴 Dead: {len(dead_sites)}
 
-Only sites under ${MAX_SITE_PRODUCT_PRICE:.2f} were added.
+Only sites between ${MIN_SITE_PRODUCT_PRICE:.2f} and ${MAX_SITE_PRODUCT_PRICE:.2f} were added.
 Check /showsites to see them."""
     
     await message.reply_document(
