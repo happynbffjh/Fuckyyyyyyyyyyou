@@ -39,12 +39,17 @@ HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
 MAX_SITES_PER_USER = 500
 MAX_GLOBAL_SITES = 500
 MAX_SITE_PRODUCT_PRICE = 20.00
-WORKER_COUNT = int(os.getenv("WORKER_COUNT", "30"))
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", "60"))
 PROXY_VALIDATION_URL = "https://httpbin.org/ip"
 PROXY_VALIDATION_TIMEOUT = 6
 PROXY_VALIDATION_CONCURRENCY = 25
 PRODUCT_CACHE_TTL_SECONDS = 300
 BIN_CACHE_TTL_SECONDS = 86400
+MAX_MASS_CHECK_CARDS = int(os.getenv("MAX_MASS_CHECK_CARDS", "50000"))
+TASK_QUEUE_MAXSIZE = int(os.getenv("TASK_QUEUE_MAXSIZE", "20000"))
+RESULT_QUEUE_MAXSIZE = int(os.getenv("RESULT_QUEUE_MAXSIZE", "20000"))
+PROGRESS_UPDATE_EVERY = int(os.getenv("PROGRESS_UPDATE_EVERY", "25"))
+PROGRESS_UPDATE_MIN_INTERVAL = float(os.getenv("PROGRESS_UPDATE_MIN_INTERVAL", "1.0"))
 
 # Logging setup
 logging.basicConfig(
@@ -69,17 +74,19 @@ proxies_col = db['proxies']
 sites_col = db['sites']
 user_sites_col = db['user_sites']
 
-# In-memory task tracking (instead of database)
-active_tasks = {}  # task_id -> task info
+# In-memory task tracking
+active_tasks = {}  # legacy map kept for compatibility
+active_task_counters = defaultdict(lambda: {'queued': 0, 'processing': 0})
 task_stats = {}    # message_id -> task stats
 task_messages = {} # message_id -> message object
 task_users = {}    # message_id -> user_id
 product_cache = {} # normalized_site -> {"data": product_info, "expires_at": epoch}
 bin_cache = {}     # bin -> {"data": bin_info, "expires_at": epoch}
+user_name_cache = {}  # user_id -> first_name
 
 # Global queues
-TASK_QUEUE = asyncio.Queue()
-RESULT_QUEUE = asyncio.Queue()
+TASK_QUEUE = asyncio.Queue(maxsize=TASK_QUEUE_MAXSIZE)
+RESULT_QUEUE = asyncio.Queue(maxsize=RESULT_QUEUE_MAXSIZE)
 active_workers = []
 
 # Placeholders for GraphQL queries (to be added manually)
@@ -520,21 +527,63 @@ async def get_bin_info(bin_number):
     }
     return fallback
 
+def register_queued_tasks(user_id, count=1):
+    if count <= 0:
+        return
+    counters = active_task_counters[user_id]
+    counters['queued'] += count
+
+def mark_task_processing(user_id):
+    counters = active_task_counters[user_id]
+    if counters['queued'] > 0:
+        counters['queued'] -= 1
+    counters['processing'] += 1
+
+def mark_task_done(user_id):
+    counters = active_task_counters.get(user_id)
+    if not counters:
+        return
+    if counters['processing'] > 0:
+        counters['processing'] -= 1
+    if counters['queued'] <= 0 and counters['processing'] <= 0:
+        active_task_counters.pop(user_id, None)
+
 def get_active_task_stats(user_id):
-    queued = 0
-    processing = 0
-    for task in active_tasks.values():
-        if task.get('user_id') != user_id:
-            continue
-        if task.get('status') == 'processing':
-            processing += 1
-        else:
-            queued += 1
+    counters = active_task_counters.get(user_id, {'queued': 0, 'processing': 0})
+    queued = max(0, counters.get('queued', 0))
+    processing = max(0, counters.get('processing', 0))
     return {
         "active_total": queued + processing,
         "active_queued": queued,
         "active_processing": processing
     }
+
+def should_update_progress(stats, force=False):
+    """Throttle task progress edits to avoid Telegram flood and slowdowns."""
+    checked = stats.get('checked', 0)
+    total = stats.get('total', 0)
+    if force or checked >= total:
+        stats['last_update_checked'] = checked
+        stats['last_update_at'] = time.time()
+        return True
+
+    now = time.time()
+    last_checked = stats.get('last_update_checked', 0)
+    last_update_at = stats.get('last_update_at', 0.0)
+    if (checked - last_checked) >= PROGRESS_UPDATE_EVERY or (now - last_update_at) >= PROGRESS_UPDATE_MIN_INTERVAL:
+        stats['last_update_checked'] = checked
+        stats['last_update_at'] = now
+        return True
+    return False
+
+async def get_cached_user_first_name(user_id):
+    cached_name = user_name_cache.get(user_id)
+    if cached_name:
+        return cached_name
+    user = await users_col.find_one({'user_id': user_id})
+    first_name = user.get('first_name', 'User') if user else 'User'
+    user_name_cache[user_id] = first_name
+    return first_name
 
 async def test_site_connection(site_url, proxy_str=None):
     """Test if a site is working by trying to add to cart and get session token"""
@@ -1413,27 +1462,25 @@ async def task_worker(worker_id):
     """Worker to process tasks from queue"""
     logger.info(f"Worker {worker_id} started")
     while True:
+        user_id = None
+        processing_registered = False
         try:
             task = await TASK_QUEUE.get()
             if task is None:
+                TASK_QUEUE.task_done()
                 break
             
-            user_id = task['user_id']
+            user_id = task.get('user_id')
+            if user_id is None:
+                raise ValueError("Task missing user_id")
             cc_data = task['cc_data']
             site = task['site']
             proxy = task.get('proxy')
             message = task['message']
             task_type = task['type']
             task_id = task.get('task_id')
-            if task_id:
-                active_tasks[task_id] = {
-                    'user_id': user_id,
-                    'task_type': task_type,
-                    'status': 'processing',
-                    'site': site,
-                    'started_at': datetime.utcnow(),
-                    'worker_id': worker_id
-                }
+            mark_task_processing(user_id)
+            processing_registered = True
             
             # Process the card
             start_time = time.time()
@@ -1474,8 +1521,8 @@ async def task_worker(worker_id):
             
         except Exception as e:
             logger.error(f"Worker {worker_id} error: {e}")
-            if 'task_id' in locals() and task_id:
-                active_tasks.pop(task_id, None)
+            if processing_registered and user_id is not None:
+                mark_task_done(user_id)
             TASK_QUEUE.task_done()
 
 # Result handler
@@ -1484,10 +1531,13 @@ async def result_handler():
     logger.info("Result handler started")
     
     while True:
+        user_id = None
         try:
             result = await RESULT_QUEUE.get()
             
-            user_id = result['user_id']
+            user_id = result.get('user_id')
+            if user_id is None:
+                raise ValueError("Result missing user_id")
             cc = result['cc']
             full_cc = result['full_cc']
             status = result['status']
@@ -1504,9 +1554,7 @@ async def result_handler():
             task_type = result.get('task_type', 'single')
             task_id = result.get('task_id')
             
-            # Get user's first name from database
-            user = await users_col.find_one({'user_id': user_id})
-            first_name = user.get('first_name', 'User') if user else 'User'
+            first_name = await get_cached_user_first_name(user_id)
             
             # Determine hit status - FIXED VERSION
             hit_status = "failed"
@@ -1623,7 +1671,9 @@ by @still_alivenow"""
                             'live': 0,
                             'otp': 0,
                             'failed': 0,
-                            'start_time': datetime.now()
+                            'start_time': datetime.now(),
+                            'last_update_checked': 0,
+                            'last_update_at': 0.0
                         }
                         task_messages[msg_id] = original_message
                         task_users[msg_id] = user_id
@@ -1639,26 +1689,25 @@ by @still_alivenow"""
                     else:
                         task_stats[msg_id]['failed'] += 1
                     
-                    # Update progress message
-                    await update_task_progress(msg_id, task_stats[msg_id])
+                    is_complete = task_stats[msg_id]['checked'] >= task_stats[msg_id]['total']
+                    if should_update_progress(task_stats[msg_id], force=is_complete):
+                        await update_task_progress(msg_id, task_stats[msg_id])
                     
-                    # Clean up if task is complete
-                    if task_stats[msg_id]['checked'] >= task_stats[msg_id]['total']:
+                    if is_complete:
                         # Keep stats for a while then clean up
                         asyncio.create_task(cleanup_task_data(msg_id, delay=300))
                             
                 except Exception as e:
                     logger.error(f"Error updating progress: {e}")
-
-            if task_id:
-                active_tasks.pop(task_id, None)
+            
+            mark_task_done(user_id)
             
             RESULT_QUEUE.task_done()
             
         except Exception as e:
             logger.error(f"Result handler error: {e}")
-            if 'task_id' in locals() and task_id:
-                active_tasks.pop(task_id, None)
+            if user_id is not None:
+                mark_task_done(user_id)
             RESULT_QUEUE.task_done()
 
 async def cleanup_task_data(msg_id, delay=300):
@@ -1808,18 +1857,25 @@ async def save_user(user_id, first_name, username=None):
             },
             upsert=True
         )
+        user_name_cache[user_id] = first_name
     except Exception as e:
         logger.error(f"Error saving user: {e}")
 
-async def increment_user_checks(user_id):
-    """Increment user's total checks count"""
+async def increment_user_checks_bulk(user_id, amount):
+    """Increment user's total checks count by amount."""
+    if amount <= 0:
+        return
     try:
         await users_col.update_one(
             {'user_id': user_id},
-            {'$inc': {'total_checks': 1}}
+            {'$inc': {'total_checks': amount}}
         )
     except Exception as e:
-        logger.error(f"Error incrementing user checks: {e}")
+        logger.error(f"Error incrementing user checks by {amount}: {e}")
+
+async def increment_user_checks(user_id):
+    """Increment user's total checks count."""
+    await increment_user_checks_bulk(user_id, 1)
 
 async def get_user_stats(user_id):
     """Get user statistics"""
@@ -1860,7 +1916,7 @@ I'm a Shopify Credit Card Checker Bot. Here are my commands:
 /chk CC|MM|YYYY|CVV - Check a single card (all responses sent)
 
 🔹 <b>Mass Check</b>
-/mchk - Send up to 15 cards (one per line) or reply to a .txt file (only hits/live cards sent)
+/mchk - Send up to {MAX_MASS_CHECK_CARDS} cards (one per line) or reply to a .txt file (only hits/live cards sent)
 
 🔹 <b>Site Checker</b>
 /chksite - Test sites and get working ones (reply to .txt file with sites)
@@ -1929,14 +1985,7 @@ async def chk_command(client, message):
     )
     
     # Generate task ID
-    task_id = f"{user.id}_{int(time.time())}_{random.randint(1000, 9999)}"
-    active_tasks[task_id] = {
-        'user_id': user.id,
-        'task_type': 'single',
-        'status': 'queued',
-        'site': site,
-        'created_at': datetime.utcnow()
-    }
+    task_id = f"{user.id}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
     
     # Add to task queue
     await TASK_QUEUE.put({
@@ -1948,12 +1997,13 @@ async def chk_command(client, message):
         'type': 'single',
         'task_id': task_id
     })
+    register_queued_tasks(user.id, 1)
     
     await increment_user_checks(user.id)
 
 @app.on_message(filters.command('mchk') & filters.private)
 async def mchk_command(client, message):
-    """Mass card check command (up to 15 cards)"""
+    """Mass card check command (up to MAX_MASS_CHECK_CARDS cards)"""
     user = message.from_user
     await save_user(user.id, user.first_name, user.username)
     
@@ -1976,10 +2026,18 @@ async def mchk_command(client, message):
             cards = [line.strip() for line in message.reply_to_message.text.split('\n') if line.strip()]
     
     if not cards:
-        await message.reply_text("❌ Please provide cards (one per line, max 15)", disable_web_page_preview=True)
+        await message.reply_text(
+            f"❌ Please provide cards (one per line, max {MAX_MASS_CHECK_CARDS})",
+            disable_web_page_preview=True
+        )
         return
     
-    cards = cards
+    if len(cards) > MAX_MASS_CHECK_CARDS:
+        await message.reply_text(
+            f"❌ Too many cards: {len(cards)}\nMax allowed: {MAX_MASS_CHECK_CARDS}",
+            disable_web_page_preview=True
+        )
+        return
     
     # Validate cards
     valid_cards = []
@@ -1987,12 +2045,12 @@ async def mchk_command(client, message):
     for card in cards:
         try:
             cc_parts = parse_cc_string(card)
-            valid_cards.append((card, cc_parts))
+            valid_cards.append(cc_parts)
         except ValueError:
             invalid_cards.append(card)
     
-    if invalid_cards:
-        await message.reply_text(f"❌ Invalid cards found: {len(invalid_cards)}", disable_web_page_preview=True)
+    if not valid_cards:
+        await message.reply_text("❌ No valid cards found in input", disable_web_page_preview=True)
         return
     
     # Get user's proxies
@@ -2005,9 +2063,9 @@ async def mchk_command(client, message):
         if not global_sites:
             await message.reply_text("❌ No sites available! Please ask admin to add sites.", disable_web_page_preview=True)
             return
-        sites = [random.choice(global_sites) for _ in range(len(valid_cards))]
+        site_pool = global_sites
     else:
-        sites = [random.choice(user_sites) for _ in range(len(valid_cards))]
+        site_pool = user_sites
     
     # Create progress message
     progress_text = f"""TASK
@@ -2048,23 +2106,20 @@ CREATED BY @still_alivenow"""
         'live': 0,
         'otp': 0,
         'failed': 0,
-        'start_time': datetime.now()
+        'start_time': datetime.now(),
+        'last_update_checked': 0,
+        'last_update_at': 0.0
     }
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
     
+    await increment_user_checks_bulk(user.id, len(valid_cards))
+
     # Add cards to queue
-    for i, (card_str, cc_parts) in enumerate(valid_cards):
+    for i, cc_parts in enumerate(valid_cards):
         proxy = random.choice(user_proxies) if user_proxies else None
-        site = sites[i]
-        task_id = f"{user.id}_{int(time.time())}_{i}"
-        active_tasks[task_id] = {
-            'user_id': user.id,
-            'task_type': 'mchk',
-            'status': 'queued',
-            'site': site,
-            'created_at': datetime.utcnow()
-        }
+        site = random.choice(site_pool)
+        task_id = f"{user.id}_{int(time.time() * 1000)}_{i}"
         
         await TASK_QUEUE.put({
             'user_id': user.id,
@@ -2075,8 +2130,15 @@ CREATED BY @still_alivenow"""
             'type': 'mchk',
             'task_id': task_id
         })
-        
-        await increment_user_checks(user.id)
+        register_queued_tasks(user.id, 1)
+        if (i + 1) % 1000 == 0:
+            await asyncio.sleep(0)
+
+    if invalid_cards:
+        await message.reply_text(
+            f"⚠️ Skipped invalid cards: {len(invalid_cards)}",
+            disable_web_page_preview=True
+        )
 
 @app.on_message(filters.command('chksite') & filters.private)
 async def chksite_command(client, message):
@@ -2154,7 +2216,9 @@ CREATED BY @still_alivenow"""
         'live': 0,
         'otp': 0,
         'failed': 0,
-        'start_time': datetime.now()
+        'start_time': datetime.now(),
+        'last_update_checked': 0,
+        'last_update_at': 0.0
     }
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
@@ -2187,8 +2251,10 @@ CREATED BY @still_alivenow"""
         else:
             task_stats[msg_id]['failed'] += 1
         
-        # Update progress message
-        await update_task_progress(msg_id, task_stats[msg_id])
+        # Update progress message (throttled)
+        is_complete = task_stats[msg_id]['checked'] >= task_stats[msg_id]['total']
+        if should_update_progress(task_stats[msg_id], force=is_complete):
+            await update_task_progress(msg_id, task_stats[msg_id])
     
     # Create result file
     result_file = f"site_test_{user.id}.txt"
