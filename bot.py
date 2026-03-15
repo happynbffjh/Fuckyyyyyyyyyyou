@@ -28,7 +28,7 @@ import nest_asyncio
 nest_asyncio.apply()
 
 # Configuration
-BOT_TOKEN = "8435065448:AAF3deY52T_TRETXKPgZnqOaqyfHXzUVlZ4"
+BOT_TOKEN = "8783552179:AAGZtUgr4AEONHyuNPPZ07na09ZHFwK3EjA"
 API_ID = 23933044
 API_HASH = "6df11147cbec7d62a323f0f498c8c03a"
 ADMINS = [7125341830]
@@ -125,7 +125,6 @@ ccn_keys = [
     "CVV",
     "CSC",
     "PAYMENTS_CREDIT_CARD_CVV_INVALID",
-    "PAYMENTS_CREDIT_CARD_VERIFICATION_VALUE_INVALID",
     "PAYMENTS_CREDIT_CARD_CSC_INVALID",
     "PAYMENTS_CREDIT_CARD_SECURITY_CODE_INVALID"
 ]
@@ -234,7 +233,7 @@ def parse_payment_response(submit_resp, receipt_resp=None):
         "invalid_cvc",
         "cvc_check",
         "VERIFICATION_VALUE_INVALID_FOR_CARD_TYPE",
-        "PAYMENTS_CREDIT_CARD_VERIFICATION_VALUE_INVALID"
+
     ]
     if any(k in resp_str for k in ccn_keys):
         return {'success': False, 'status': 'Approved ⇾ CCN', 'message': 'CVV_MISMATCH', 'is_chargeable': True, 'raw_typename': receipt_type or typename}
