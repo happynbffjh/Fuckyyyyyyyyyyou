@@ -86,6 +86,9 @@ product_cache = {} # normalized_site -> {"data": product_info, "expires_at": epo
 bin_cache = {}     # bin -> {"data": bin_info, "expires_at": epoch}
 user_name_cache = {}  # user_id -> first_name
 mchk_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
+user_active_mchk_batches = defaultdict(set)  # user_id -> set(batch_id)
+mchk_batches = {}  # batch_id -> {user_id, msg_id, status, created_at}
+cancelled_mchk_batches = set()  # batch_ids cancelled by /stopmchk
 
 # Global queues
 TASK_QUEUE = asyncio.Queue(maxsize=TASK_QUEUE_MAXSIZE)
@@ -540,6 +543,16 @@ def register_queued_tasks(user_id, count=1):
     counters = active_task_counters[user_id]
     counters['queued'] += count
 
+def decrement_queued_tasks(user_id, count=1):
+    if count <= 0:
+        return
+    counters = active_task_counters.get(user_id)
+    if not counters:
+        return
+    counters['queued'] = max(0, counters['queued'] - count)
+    if counters['queued'] <= 0 and counters['processing'] <= 0:
+        active_task_counters.pop(user_id, None)
+
 def mark_task_processing(user_id):
     counters = active_task_counters[user_id]
     if counters['queued'] > 0:
@@ -564,6 +577,76 @@ def get_active_task_stats(user_id):
         "active_queued": queued,
         "active_processing": processing
     }
+
+def remove_user_from_round_robin(user_id):
+    if user_id not in pending_users_set:
+        return
+    pending_users_set.discard(user_id)
+    try:
+        pending_users_rr.remove(user_id)
+    except ValueError:
+        pass
+
+def register_mchk_batch(user_id, batch_id, msg_id):
+    user_active_mchk_batches[user_id].add(batch_id)
+    mchk_batches[batch_id] = {
+        'user_id': user_id,
+        'msg_id': msg_id,
+        'status': 'active',
+        'created_at': time.time()
+    }
+
+def finalize_mchk_batch(batch_id):
+    info = mchk_batches.get(batch_id)
+    if not info:
+        cancelled_mchk_batches.discard(batch_id)
+        return
+    user_id = info.get('user_id')
+    if user_id in user_active_mchk_batches:
+        user_active_mchk_batches[user_id].discard(batch_id)
+        if not user_active_mchk_batches[user_id]:
+            user_active_mchk_batches.pop(user_id, None)
+    mchk_batches.pop(batch_id, None)
+    cancelled_mchk_batches.discard(batch_id)
+
+def cancel_user_mchk_batches(user_id):
+    """Cancel all active mchk batches for user and remove queued tasks."""
+    global pending_tasks_total
+
+    batch_ids = set(user_active_mchk_batches.get(user_id, set()))
+    if not batch_ids:
+        return {'cancelled_batches': [], 'removed_pending': 0, 'msg_ids': []}
+
+    for batch_id in batch_ids:
+        cancelled_mchk_batches.add(batch_id)
+        if batch_id in mchk_batches:
+            mchk_batches[batch_id]['status'] = 'cancelled'
+        user_active_mchk_batches[user_id].discard(batch_id)
+    if user_id in user_active_mchk_batches and not user_active_mchk_batches[user_id]:
+        user_active_mchk_batches.pop(user_id, None)
+
+    removed_pending = 0
+    user_queue = pending_user_tasks.get(user_id)
+    if user_queue:
+        kept_tasks = deque()
+        for task in user_queue:
+            if task.get('type') == 'mchk' and task.get('batch_id') in batch_ids:
+                removed_pending += 1
+            else:
+                kept_tasks.append(task)
+
+        if kept_tasks:
+            pending_user_tasks[user_id] = kept_tasks
+        else:
+            pending_user_tasks.pop(user_id, None)
+            remove_user_from_round_robin(user_id)
+
+    if removed_pending:
+        pending_tasks_total = max(0, pending_tasks_total - removed_pending)
+        decrement_queued_tasks(user_id, removed_pending)
+
+    msg_ids = [mchk_batches[b]['msg_id'] for b in batch_ids if b in mchk_batches and mchk_batches[b].get('msg_id') is not None]
+    return {'cancelled_batches': list(batch_ids), 'removed_pending': removed_pending, 'msg_ids': msg_ids}
 
 def get_user_enqueue_capacity(user_id):
     """Current enqueue capacity for a user and global pool."""
@@ -1545,6 +1628,13 @@ async def task_worker(worker_id):
             message = task['message']
             task_type = task['type']
             task_id = task.get('task_id')
+            batch_id = task.get('batch_id')
+
+            if task_type == 'mchk' and batch_id in cancelled_mchk_batches:
+                decrement_queued_tasks(user_id, 1)
+                TASK_QUEUE.task_done()
+                continue
+
             mark_task_processing(user_id)
             processing_registered = True
             
@@ -1578,7 +1668,8 @@ async def task_worker(worker_id):
                 'message': message,
                 'task_type': task_type,
                 'task_id': task_id,
-                'mchk_show_live_otp': task.get('mchk_show_live_otp', True)
+                'mchk_show_live_otp': task.get('mchk_show_live_otp', True),
+                'batch_id': batch_id
             }
             
             # Put result in queue
@@ -1621,6 +1712,12 @@ async def result_handler():
             task_type = result.get('task_type', 'single')
             task_id = result.get('task_id')
             mchk_show_live_otp = result.get('mchk_show_live_otp', True)
+            batch_id = result.get('batch_id')
+
+            if task_type == 'mchk' and batch_id in cancelled_mchk_batches:
+                mark_task_done(user_id)
+                RESULT_QUEUE.task_done()
+                continue
             
             first_name = await get_cached_user_first_name(user_id)
             
@@ -1767,6 +1864,8 @@ by @still_alivenow"""
                     if is_complete:
                         # Keep stats for a while then clean up
                         asyncio.create_task(cleanup_task_data(msg_id, delay=300))
+                        if task_type == 'mchk' and batch_id:
+                            finalize_mchk_batch(batch_id)
                             
                 except Exception as e:
                     logger.error(f"Error updating progress: {e}")
@@ -1784,9 +1883,13 @@ by @still_alivenow"""
 async def cleanup_task_data(msg_id, delay=300):
     """Clean up task data after delay"""
     await asyncio.sleep(delay)
-    task_stats.pop(msg_id, None)
+    stats = task_stats.pop(msg_id, None)
     task_messages.pop(msg_id, None)
     task_users.pop(msg_id, None)
+    if isinstance(stats, dict):
+        batch_id = stats.get('batch_id')
+        if batch_id:
+            finalize_mchk_batch(batch_id)
 
 # Callback query handler
 @app.on_callback_query()
@@ -2019,7 +2122,8 @@ I'm a Shopify Credit Card Checker Bot. Here are my commands:
 /chk CC|MM|YYYY|CVV - Check a single card (all responses sent)
 
 🔹 <b>Mass Check</b>
-/mchk - Send up to {MAX_MASS_CHECK_CARDS} cards (one per line) or reply to a .txt file (only hits/live cards sent)
+/mchk - Send up to {MAX_MASS_CHECK_CARDS} cards (one per line) or reply to a .txt file
+/stopmchk - Stop your current mass check batch
 
 🔹 <b>Site Checker</b>
 /chksite - Test sites and get working ones (reply to .txt file with sites)
@@ -2260,6 +2364,8 @@ CREATED BY @still_alivenow"""
         disable_web_page_preview=True
     )
     
+    batch_id = f"mchk_{user.id}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+
     # Store task info
     msg_id = processing_msg.id
     task_stats[msg_id] = {
@@ -2271,10 +2377,12 @@ CREATED BY @still_alivenow"""
         'failed': 0,
         'start_time': datetime.now(),
         'last_update_checked': 0,
-        'last_update_at': 0.0
+        'last_update_at': 0.0,
+        'batch_id': batch_id
     }
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
+    register_mchk_batch(user.id, batch_id, msg_id)
     
     # Add cards to fair pending queue
     queued_cards = 0
@@ -2291,7 +2399,8 @@ CREATED BY @still_alivenow"""
             'message': processing_msg,
             'type': 'mchk',
             'task_id': task_id,
-            'mchk_show_live_otp': send_live_otp
+            'mchk_show_live_otp': send_live_otp,
+            'batch_id': batch_id
         })
         if not queued_ok:
             break
@@ -2307,6 +2416,7 @@ CREATED BY @still_alivenow"""
             task_stats.pop(msg_id, None)
             task_messages.pop(msg_id, None)
             task_users.pop(msg_id, None)
+            finalize_mchk_batch(batch_id)
             await processing_msg.edit_text("❌ Queue is full. Please try again shortly.", disable_web_page_preview=True)
             return
     await increment_user_checks_bulk(user.id, queued_cards)
@@ -2321,6 +2431,43 @@ CREATED BY @still_alivenow"""
             f"⚠️ Queue limit reached. Accepted: {queued_cards} | Skipped: {dropped_for_capacity}",
             disable_web_page_preview=True
         )
+
+@app.on_message(filters.command('stopmchk') & filters.private)
+async def stopmchk_command(client, message):
+    """Stop all active mass-check batches for user."""
+    user = message.from_user
+    await save_user(user.id, user.first_name, user.username)
+
+    cancel_info = cancel_user_mchk_batches(user.id)
+    cancelled_batches = cancel_info.get('cancelled_batches', [])
+    removed_pending = cancel_info.get('removed_pending', 0)
+    msg_ids = set(cancel_info.get('msg_ids', []))
+
+    if not cancelled_batches:
+        await message.reply_text("ℹ️ No active mass check to stop.", disable_web_page_preview=True)
+        return
+
+    for msg_id in msg_ids:
+        progress_msg = task_messages.get(msg_id)
+        if not progress_msg:
+            continue
+        stats = task_stats.get(msg_id, {})
+        checked = stats.get('checked', 0)
+        total = stats.get('total', 0)
+        try:
+            await progress_msg.edit_text(
+                f"⛔ MASS CHECK STOPPED\n\nChecked: {checked}/{total}\nPending removed: {removed_pending}",
+                disable_web_page_preview=True
+            )
+        except Exception:
+            pass
+        asyncio.create_task(cleanup_task_data(msg_id, delay=10))
+
+    await message.reply_text(
+        f"✅ Stopped mass check batches: {len(cancelled_batches)}\n"
+        f"🗑️ Removed pending cards: {removed_pending}",
+        disable_web_page_preview=True
+    )
 
 @app.on_message(filters.command('chksite') & filters.private)
 async def chksite_command(client, message):
