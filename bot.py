@@ -85,6 +85,7 @@ task_users = {}    # message_id -> user_id
 product_cache = {} # normalized_site -> {"data": product_info, "expires_at": epoch}
 bin_cache = {}     # bin -> {"data": bin_info, "expires_at": epoch}
 user_name_cache = {}  # user_id -> first_name
+mchk_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
 
 # Global queues
 TASK_QUEUE = asyncio.Queue(maxsize=TASK_QUEUE_MAXSIZE)
@@ -1576,7 +1577,8 @@ async def task_worker(worker_id):
                 'process_time': process_time,
                 'message': message,
                 'task_type': task_type,
-                'task_id': task_id
+                'task_id': task_id,
+                'mchk_show_live_otp': task.get('mchk_show_live_otp', True)
             }
             
             # Put result in queue
@@ -1618,6 +1620,7 @@ async def result_handler():
             original_message = result.get('message')
             task_type = result.get('task_type', 'single')
             task_id = result.get('task_id')
+            mchk_show_live_otp = result.get('mchk_show_live_otp', True)
             
             first_name = await get_cached_user_first_name(user_id)
             
@@ -1701,8 +1704,11 @@ by @still_alivenow"""
                     logger.error(f"Error sending message to user {user_id}: {e}")
             
             elif task_type in ['mchk', 'chksite']:
-                # For mass checks, only send HIT and LIVE cards
-                if hit_status in ['hit', 'live', 'otp']:
+                should_send = hit_status in ['hit', 'live', 'otp']
+                if task_type == 'mchk' and not mchk_show_live_otp:
+                    should_send = hit_status == 'hit'
+
+                if should_send:
                     try:
                         await app.send_message(
                             chat_id=user_id,
@@ -1786,6 +1792,38 @@ async def cleanup_task_data(msg_id, delay=300):
 @app.on_callback_query()
 async def handle_callback(client, callback_query: CallbackQuery):
     """Handle callback queries from inline buttons"""
+    data = callback_query.data or ""
+
+    if data.startswith("mchk_pref:"):
+        try:
+            _, choice_token, pref_id = data.split(":", 2)
+        except ValueError:
+            await callback_query.answer("Invalid selection", show_alert=True)
+            return
+
+        session = mchk_pref_sessions.get(pref_id)
+        if not session:
+            await callback_query.answer("This selection has expired", show_alert=True)
+            return
+
+        user = callback_query.from_user
+        if not user or user.id != session.get('user_id'):
+            await callback_query.answer("This button is not for you", show_alert=True)
+            return
+
+        choice = 'yes' if choice_token == 'y' else 'no'
+        session['choice'] = choice
+        session['event'].set()
+
+        choice_text = "Yes (HIT + LIVE + OTP)" if choice == 'yes' else "No (HIT only)"
+        await callback_query.answer(f"Selected: {choice_text}")
+
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
     await callback_query.answer()  # Just acknowledge the callback
 
 # Database functions
@@ -2145,6 +2183,52 @@ async def mchk_command(client, message):
 
     accepted_cards = valid_cards[:capacity]
     dropped_for_capacity = max(0, len(valid_cards) - len(accepted_cards))
+
+    # Ask user how to deliver approved results
+    pref_id = hashlib.md5(
+        f"{user.id}:{time.time_ns()}:{random.random()}".encode()
+    ).hexdigest()[:12]
+    pref_event = asyncio.Event()
+    mchk_pref_sessions[pref_id] = {
+        'user_id': user.id,
+        'choice': None,
+        'event': pref_event,
+        'created_at': time.time()
+    }
+
+    pref_text = (
+        "Do you want Approved CC in txt?\n"
+        "Choose Yes to receive Approved CCs in chat.\n\n"
+        "Choose No to only receive Charged CC."
+    )
+    pref_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes", callback_data=f"mchk_pref:y:{pref_id}")],
+        [InlineKeyboardButton("No", callback_data=f"mchk_pref:n:{pref_id}")]
+    ])
+    pref_message = await message.reply_text(
+        pref_text,
+        reply_markup=pref_keyboard,
+        disable_web_page_preview=True
+    )
+
+    send_live_otp = False
+    try:
+        await asyncio.wait_for(pref_event.wait(), timeout=60)
+        selected_choice = mchk_pref_sessions.get(pref_id, {}).get('choice', 'no')
+        send_live_otp = selected_choice == 'yes'
+    except asyncio.TimeoutError:
+        send_live_otp = False
+    finally:
+        mchk_pref_sessions.pop(pref_id, None)
+
+    selected_text = "Yes (HIT + LIVE + OTP)" if send_live_otp else "No (HIT only)"
+    try:
+        await pref_message.edit_text(
+            f"{pref_text}\n\n✅ Selected: {selected_text}",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        pass
     
     # Create progress message
     progress_text = f"""TASK
@@ -2206,7 +2290,8 @@ CREATED BY @still_alivenow"""
             'proxy': proxy,
             'message': processing_msg,
             'type': 'mchk',
-            'task_id': task_id
+            'task_id': task_id,
+            'mchk_show_live_otp': send_live_otp
         })
         if not queued_ok:
             break
