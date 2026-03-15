@@ -45,7 +45,8 @@ MAX_SITE_PRODUCT_PRICE = 20.00
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "60"))
 PROXY_VALIDATION_URL = "https://httpbin.org/ip"
 PROXY_VALIDATION_TIMEOUT = 6
-PROXY_VALIDATION_CONCURRENCY = 25
+PROXY_VALIDATION_CONCURRENCY = int(os.getenv("PROXY_VALIDATION_CONCURRENCY", "20"))
+SITE_CHECK_WORKERS = int(os.getenv("SITE_CHECK_WORKERS", "20"))
 PRODUCT_CACHE_TTL_SECONDS = 300
 BIN_CACHE_TTL_SECONDS = 86400
 MAX_MASS_CHECK_CARDS = int(os.getenv("MAX_MASS_CHECK_CARDS", "50000"))
@@ -3117,36 +3118,47 @@ CREATED BY @still_alivenow"""
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
     
-    # Test sites
+    # Test sites with worker pool
     working_sites = []
     skipped_sites = []
     dead_sites = []
-    
-    for i, site in enumerate(sites):
-        # Update progress
-        is_working, message_text, product_info = await test_site_connection(site, proxy)
-        
-        if is_working:
-            saved, save_msg = await save_working_site(user.id, site, product_info)
-            if saved:
-                working_sites.append((site, product_info))
-                hit_status = "hit"
-            else:
-                skipped_sites.append((site, product_info, save_msg))
-                hit_status = "failed"
-        else:
-            dead_sites.append((site, message_text))
-            hit_status = "failed"
-        
-        # Update stats
-        task_stats[msg_id]['checked'] = i + 1
-        if hit_status == 'hit':
+    site_check_semaphore = asyncio.Semaphore(SITE_CHECK_WORKERS)
+
+    async def _check_site(site_to_check):
+        try:
+            async with site_check_semaphore:
+                is_working, message_text, product_info = await test_site_connection(site_to_check, proxy)
+
+            if is_working:
+                saved, save_msg = await save_working_site(user.id, site_to_check, product_info)
+                if saved:
+                    return "hit", site_to_check, product_info, None
+                return "skipped", site_to_check, product_info, save_msg
+
+            return "dead", site_to_check, None, message_text
+        except Exception as e:
+            return "dead", site_to_check, None, str(e)
+
+    check_tasks = [asyncio.create_task(_check_site(site)) for site in sites]
+    processed_count = 0
+
+    for done_task in asyncio.as_completed(check_tasks):
+        result_type, checked_site, product_info, detail = await done_task
+        processed_count += 1
+
+        if result_type == "hit":
+            working_sites.append((checked_site, product_info))
             task_stats[msg_id]['hit'] += 1
-        else:
+        elif result_type == "skipped":
+            skipped_sites.append((checked_site, product_info, detail))
             task_stats[msg_id]['failed'] += 1
-        
-        # Update progress message (throttled)
-        is_complete = task_stats[msg_id]['checked'] >= task_stats[msg_id]['total']
+        else:
+            dead_sites.append((checked_site, detail))
+            task_stats[msg_id]['failed'] += 1
+
+        # Update stats/progress
+        task_stats[msg_id]['checked'] = processed_count
+        is_complete = processed_count >= task_stats[msg_id]['total']
         if should_update_progress(task_stats[msg_id], force=is_complete):
             await update_task_progress(msg_id, task_stats[msg_id])
     
