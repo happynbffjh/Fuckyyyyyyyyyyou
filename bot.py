@@ -21,7 +21,7 @@ import aiofiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import MongoClient
 from bson import ObjectId
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 import nest_asyncio
@@ -50,6 +50,8 @@ TASK_QUEUE_MAXSIZE = int(os.getenv("TASK_QUEUE_MAXSIZE", "20000"))
 RESULT_QUEUE_MAXSIZE = int(os.getenv("RESULT_QUEUE_MAXSIZE", "20000"))
 PROGRESS_UPDATE_EVERY = int(os.getenv("PROGRESS_UPDATE_EVERY", "25"))
 PROGRESS_UPDATE_MIN_INTERVAL = float(os.getenv("PROGRESS_UPDATE_MIN_INTERVAL", "1.0"))
+MAX_PENDING_TASKS_PER_USER = int(os.getenv("MAX_PENDING_TASKS_PER_USER", "50000"))
+MAX_TOTAL_PENDING_TASKS = int(os.getenv("MAX_TOTAL_PENDING_TASKS", "250000"))
 
 # Logging setup
 logging.basicConfig(
@@ -88,6 +90,10 @@ user_name_cache = {}  # user_id -> first_name
 TASK_QUEUE = asyncio.Queue(maxsize=TASK_QUEUE_MAXSIZE)
 RESULT_QUEUE = asyncio.Queue(maxsize=RESULT_QUEUE_MAXSIZE)
 active_workers = []
+pending_user_tasks = defaultdict(deque)  # user_id -> deque[task]
+pending_users_rr = deque()               # round-robin users
+pending_users_set = set()                # fast membership for RR deque
+pending_tasks_total = 0
 
 # Placeholders for GraphQL queries (to be added manually)
 # QUERY_PROPOSAL_SHIPPING
@@ -557,6 +563,66 @@ def get_active_task_stats(user_id):
         "active_queued": queued,
         "active_processing": processing
     }
+
+def get_user_enqueue_capacity(user_id):
+    """Current enqueue capacity for a user and global pool."""
+    global_left = MAX_TOTAL_PENDING_TASKS - pending_tasks_total
+    user_left = MAX_PENDING_TASKS_PER_USER - len(pending_user_tasks.get(user_id, ()))
+    return max(0, min(global_left, user_left))
+
+def enqueue_user_task(task):
+    """Queue task into fair per-user pending buffer."""
+    global pending_tasks_total
+    user_id = task.get('user_id')
+    if user_id is None:
+        return False, "Missing user_id"
+    if pending_tasks_total >= MAX_TOTAL_PENDING_TASKS:
+        return False, "System queue is full, try again later"
+
+    user_queue = pending_user_tasks[user_id]
+    if len(user_queue) >= MAX_PENDING_TASKS_PER_USER:
+        return False, f"Per-user queue limit reached ({MAX_PENDING_TASKS_PER_USER})"
+
+    user_queue.append(task)
+    pending_tasks_total += 1
+
+    if user_id not in pending_users_set:
+        pending_users_rr.append(user_id)
+        pending_users_set.add(user_id)
+    return True, None
+
+def dequeue_pending_task_round_robin():
+    """Pop one task fairly across users in round-robin order."""
+    global pending_tasks_total
+    if not pending_users_rr:
+        return None
+
+    user_id = pending_users_rr.popleft()
+    pending_users_set.discard(user_id)
+    user_queue = pending_user_tasks.get(user_id)
+    if not user_queue:
+        pending_user_tasks.pop(user_id, None)
+        return None
+
+    task = user_queue.popleft()
+    pending_tasks_total = max(0, pending_tasks_total - 1)
+
+    if user_queue:
+        pending_users_rr.append(user_id)
+        pending_users_set.add(user_id)
+    else:
+        pending_user_tasks.pop(user_id, None)
+    return task
+
+async def fair_task_dispatcher():
+    """Move tasks from fair pending queues into worker queue."""
+    logger.info("Fair dispatcher started")
+    while True:
+        task = dequeue_pending_task_round_robin()
+        if task is None:
+            await asyncio.sleep(0.01)
+            continue
+        await TASK_QUEUE.put(task)
 
 def should_update_progress(stats, force=False):
     """Throttle task progress edits to avoid Telegram flood and slowdowns."""
@@ -1414,10 +1480,9 @@ async def update_task_progress(message_id, stats, start_time=None):
         elapsed = datetime.now() - start_time
         elapsed_str = str(elapsed).split('.')[0]  # Remove microseconds
         
-        # Get user info
+        # Get user info (cached)
         user_id = task_users.get(message_id)
-        user = await users_col.find_one({'user_id': user_id}) if user_id else None
-        user_name = user.get('first_name', 'User') if user else 'User'
+        user_name = await get_cached_user_first_name(user_id) if user_id else 'User'
         
         # Create progress text
         progress_text = f"""TASK
@@ -1986,9 +2051,7 @@ async def chk_command(client, message):
     
     # Generate task ID
     task_id = f"{user.id}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-    
-    # Add to task queue
-    await TASK_QUEUE.put({
+    task_payload = {
         'user_id': user.id,
         'cc_data': cc_parts,
         'site': site,
@@ -1996,7 +2059,12 @@ async def chk_command(client, message):
         'message': processing_msg,
         'type': 'single',
         'task_id': task_id
-    })
+    }
+    queued_ok, queue_msg = enqueue_user_task(task_payload)
+    if not queued_ok:
+        await processing_msg.edit_text(f"❌ {queue_msg}", disable_web_page_preview=True)
+        return
+
     register_queued_tasks(user.id, 1)
     
     await increment_user_checks(user.id)
@@ -2066,6 +2134,17 @@ async def mchk_command(client, message):
         site_pool = global_sites
     else:
         site_pool = user_sites
+
+    capacity = get_user_enqueue_capacity(user.id)
+    if capacity <= 0:
+        await message.reply_text(
+            "❌ System is busy right now. Try again in a moment.",
+            disable_web_page_preview=True
+        )
+        return
+
+    accepted_cards = valid_cards[:capacity]
+    dropped_for_capacity = max(0, len(valid_cards) - len(accepted_cards))
     
     # Create progress message
     progress_text = f"""TASK
@@ -2077,7 +2156,7 @@ CREATED BY @still_alivenow"""
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"TOTAL {len(valid_cards)}", callback_data="ignore"),
+            InlineKeyboardButton(f"TOTAL {len(accepted_cards)}", callback_data="ignore"),
             InlineKeyboardButton(f"CHECKED 0", callback_data="ignore")
         ],
         [
@@ -2100,7 +2179,7 @@ CREATED BY @still_alivenow"""
     # Store task info
     msg_id = processing_msg.id
     task_stats[msg_id] = {
-        'total': len(valid_cards),
+        'total': len(accepted_cards),
         'checked': 0,
         'hit': 0,
         'live': 0,
@@ -2113,15 +2192,14 @@ CREATED BY @still_alivenow"""
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
     
-    await increment_user_checks_bulk(user.id, len(valid_cards))
-
-    # Add cards to queue
-    for i, cc_parts in enumerate(valid_cards):
+    # Add cards to fair pending queue
+    queued_cards = 0
+    for i, cc_parts in enumerate(accepted_cards):
         proxy = random.choice(user_proxies) if user_proxies else None
         site = random.choice(site_pool)
         task_id = f"{user.id}_{int(time.time() * 1000)}_{i}"
-        
-        await TASK_QUEUE.put({
+
+        queued_ok, _ = enqueue_user_task({
             'user_id': user.id,
             'cc_data': cc_parts,
             'site': site,
@@ -2130,13 +2208,32 @@ CREATED BY @still_alivenow"""
             'type': 'mchk',
             'task_id': task_id
         })
+        if not queued_ok:
+            break
+        queued_cards += 1
         register_queued_tasks(user.id, 1)
         if (i + 1) % 1000 == 0:
             await asyncio.sleep(0)
 
+    if queued_cards != len(accepted_cards):
+        task_stats[msg_id]['total'] = queued_cards
+        dropped_for_capacity += len(accepted_cards) - queued_cards
+        if queued_cards == 0:
+            task_stats.pop(msg_id, None)
+            task_messages.pop(msg_id, None)
+            task_users.pop(msg_id, None)
+            await processing_msg.edit_text("❌ Queue is full. Please try again shortly.", disable_web_page_preview=True)
+            return
+    await increment_user_checks_bulk(user.id, queued_cards)
+
     if invalid_cards:
         await message.reply_text(
             f"⚠️ Skipped invalid cards: {len(invalid_cards)}",
+            disable_web_page_preview=True
+        )
+    if dropped_for_capacity:
+        await message.reply_text(
+            f"⚠️ Queue limit reached. Accepted: {queued_cards} | Skipped: {dropped_for_capacity}",
             disable_web_page_preview=True
         )
 
@@ -2904,6 +3001,9 @@ async def main():
     
     # Initialize database
     await init_db()
+
+    # Start fair dispatcher
+    dispatcher_task = asyncio.create_task(fair_task_dispatcher())
     
     # Start workers
     for i in range(WORKER_COUNT):
@@ -2923,6 +3023,10 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Stopping bot...")
     finally:
+        # Stop dispatcher
+        dispatcher_task.cancel()
+        await asyncio.gather(dispatcher_task, return_exceptions=True)
+
         # Stop workers
         for _ in range(WORKER_COUNT):
             await TASK_QUEUE.put(None)
