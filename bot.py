@@ -29,6 +29,7 @@ nest_asyncio.apply()
 
 # Configuration
 BOT_TOKEN = "8435065448:AAF3deY52T_TRETXKPgZnqOaqyfHXzUVlZ4"
+API_ID = 23933044
 API_HASH = "6df11147cbec7d62a323f0f498c8c03a"
 ADMINS = [7125341830]
 MONGO_URL = "mongodb+srv://animepahe:animepahe@animepahe.o8zgy.mongodb.net/?retryWrites=true&w=majority"
