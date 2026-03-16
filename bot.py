@@ -2155,14 +2155,14 @@ async def result_handler():
             # Format site name for compact user display.
             site_name = format_site_display_name(site)
             
-            # Format receipt with clickable order URL
+            # Always show receipt id when available (requested format).
             receipt_text = ""
             if receipt_id:
-                if order_url and order_url != 'N/A' and order_url:
-                    safe_order_url = html.escape(str(order_url), quote=True)
-                    receipt_text = f"🧾 <a href='{safe_order_url}'>View Order</a>"
-                else:
-                    receipt_text = f"🧾 Receipt: <code>{html.escape(str(receipt_id))}</code>"
+                safe_receipt_id = html.escape(str(receipt_id))
+                receipt_text = f"🧾 Receipt: <code>{safe_receipt_id}</code>"
+            elif order_url and order_url != 'N/A':
+                safe_order_url = html.escape(str(order_url), quote=True)
+                receipt_text = f"🧾 <a href='{safe_order_url}'>View Order</a>"
             
             # Format message with click-to-copy card
             if hit_status == "hit":
@@ -2210,7 +2210,7 @@ async def result_handler():
 🌐 Site: {safe_site_name}
 💰 Amount: {formatted_price} {safe_currency}
 {receipt_text}
-⚡ Time: {process_time}s
+⏱️ Time Taken: {process_time}s
 👤 User: {safe_first_name}
 
 by @still_alivenow"""
