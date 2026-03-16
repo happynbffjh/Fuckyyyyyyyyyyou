@@ -2221,6 +2221,18 @@ async def cleanup_task_data(msg_id, delay=300):
         if batch_id:
             finalize_mchk_batch(batch_id)
 
+async def safe_callback_answer(callback_query: CallbackQuery, text: str = "", show_alert: bool = False):
+    """Answer callback safely (ignore expired/invalid callback id)."""
+    try:
+        if text:
+            await callback_query.answer(text, show_alert=show_alert)
+        else:
+            await callback_query.answer()
+    except Exception as e:
+        if "QUERY_ID_INVALID" in str(e).upper():
+            return
+        logger.error(f"Callback answer error: {e}")
+
 # Callback query handler
 @app.on_callback_query()
 async def handle_callback(client, callback_query: CallbackQuery):
@@ -2231,17 +2243,17 @@ async def handle_callback(client, callback_query: CallbackQuery):
         try:
             _, choice_token, pref_id = data.split(":", 2)
         except ValueError:
-            await callback_query.answer("Invalid selection", show_alert=True)
+            await safe_callback_answer(callback_query, "Invalid selection", show_alert=True)
             return
 
         session = mchk_pref_sessions.get(pref_id)
         if not session:
-            await callback_query.answer("This selection has expired", show_alert=True)
+            await safe_callback_answer(callback_query, "This selection has expired", show_alert=True)
             return
 
         user = callback_query.from_user
         if not user or user.id != session.get('user_id'):
-            await callback_query.answer("This button is not for you", show_alert=True)
+            await safe_callback_answer(callback_query, "This button is not for you", show_alert=True)
             return
 
         choice = 'yes' if choice_token == 'y' else 'no'
@@ -2249,7 +2261,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         session['event'].set()
 
         choice_text = "Yes (HIT + LIVE + 3DS)" if choice == 'yes' else "No (HIT only)"
-        await callback_query.answer(f"Selected: {choice_text}")
+        await safe_callback_answer(callback_query, f"Selected: {choice_text}")
 
         try:
             await callback_query.message.edit_reply_markup(reply_markup=None)
@@ -2261,17 +2273,17 @@ async def handle_callback(client, callback_query: CallbackQuery):
         try:
             _, choice_token, pref_id = data.split(":", 2)
         except ValueError:
-            await callback_query.answer("Invalid selection", show_alert=True)
+            await safe_callback_answer(callback_query, "Invalid selection", show_alert=True)
             return
 
         session = mchk_captcha_pref_sessions.get(pref_id)
         if not session:
-            await callback_query.answer("This selection has expired", show_alert=True)
+            await safe_callback_answer(callback_query, "This selection has expired", show_alert=True)
             return
 
         user = callback_query.from_user
         if not user or user.id != session.get('user_id'):
-            await callback_query.answer("This button is not for you", show_alert=True)
+            await safe_callback_answer(callback_query, "This button is not for you", show_alert=True)
             return
 
         choice = 'yes' if choice_token == 'y' else 'no'
@@ -2279,7 +2291,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         session['event'].set()
 
         choice_text = "Yes (send CAPTCHA txt)" if choice == 'yes' else "No"
-        await callback_query.answer(f"Selected: {choice_text}")
+        await safe_callback_answer(callback_query, f"Selected: {choice_text}")
 
         try:
             await callback_query.message.edit_reply_markup(reply_markup=None)
@@ -2291,7 +2303,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         batch_id = data.split(":", 1)[1].strip()
         user = callback_query.from_user
         if not user:
-            await callback_query.answer("User not found", show_alert=True)
+            await safe_callback_answer(callback_query, "User not found", show_alert=True)
             return
 
         cancel_info = cancel_user_mchk_batches(user.id, batch_ids=[batch_id])
@@ -2300,7 +2312,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         msg_ids = set(cancel_info.get('msg_ids', []))
 
         if not cancelled_batches:
-            await callback_query.answer("Batch already stopped or finished", show_alert=True)
+            await safe_callback_answer(callback_query, "Batch already stopped or finished", show_alert=True)
             return
 
         for msg_id in msg_ids:
@@ -2319,10 +2331,10 @@ async def handle_callback(client, callback_query: CallbackQuery):
                 pass
             asyncio.create_task(cleanup_task_data(msg_id, delay=10))
 
-        await callback_query.answer(f"Stopped batch. Removed pending: {removed_pending}")
+        await safe_callback_answer(callback_query, f"Stopped batch. Removed pending: {removed_pending}")
         return
 
-    await callback_query.answer()  # Just acknowledge the callback
+    await safe_callback_answer(callback_query)  # Just acknowledge the callback
 
 # Database functions
 async def init_db():
@@ -3149,8 +3161,7 @@ async def clean_command(client, message):
 
         await message.reply_document(
             output_file,
-            caption=f"✅ Clean complete\nValid: {len(cleaned)}\nInvalid: {invalid}\nDuplicates removed: {max(0, len(lines)-len(cleaned)-invalid)}",
-            disable_web_page_preview=True
+            caption=f"✅ Clean complete\nValid: {len(cleaned)}\nInvalid: {invalid}\nDuplicates removed: {max(0, len(lines)-len(cleaned)-invalid)}"
         )
         os.remove(output_file)
     finally:
@@ -3593,8 +3604,7 @@ async def showsites_command(client, message):
                     await f.write(f"{site_entry}\n")
         await message.reply_document(
             file_path,
-            caption=f"📋 Your Working Sites ({len(sites_list)} sites)",
-            disable_web_page_preview=True
+            caption=f"📋 Your Working Sites ({len(sites_list)} sites)"
         )
         os.remove(file_path)
     else:
