@@ -400,7 +400,8 @@ async def make_graphql_request_with_captcha_handling(
             
         except Exception as e:
             if attempt == max_retries:
-                return None, str(e), False
+                err_msg = f"{type(e).__name__}: {e}".strip()
+                return None, (err_msg if err_msg else "Request exception"), False
             await asyncio.sleep(1)
     
     return response, response_text, False
@@ -507,6 +508,19 @@ def extract_clean_response(message):
             return first_word
     
     return message[:50]
+
+def normalize_response_text(response):
+    """Normalize gateway response text to a stable, user-safe value."""
+    if response is None:
+        return "UNKNOWN_ERROR"
+
+    text = str(response).strip()
+    if not text or text.lower() in {"none", "null", "undefined"}:
+        return "UNKNOWN_ERROR"
+
+    # Keep response readable in Telegram and avoid malformed multiline blobs.
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if text else "UNKNOWN_ERROR"
 
 def parse_cc_string(cc_string):
     parts = cc_string.split('|')
@@ -1196,7 +1210,8 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                             if available_proxies:
                                 proxy_str = random.choice(available_proxies)
                                 proxy = parse_proxy(proxy_str)
-                                logger.info(f"Retrying with new proxy for user {user_id}")
+                                retry_reason = normalize_response_text(resp_text)[:180]
+                                logger.info(f"Retrying with new proxy for user {user_id} (reason: {retry_reason})")
                                 continue
                     return False, f"Request failed: {resp_text}", gateway, total_price, currency, receipt_id, order_url
                 
@@ -1643,7 +1658,8 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     if available_proxies:
                         proxy_str = random.choice(available_proxies)
                         proxy = parse_proxy(proxy_str)
-                        logger.info(f"Retrying after exception with new proxy for user {user_id}")
+                        retry_reason = normalize_response_text(f"{type(e).__name__}: {e}")[:180]
+                        logger.info(f"Retrying after exception with new proxy for user {user_id} (reason: {retry_reason})")
                         continue
             return False, f"Error Processing Card: {str(e)}", gateway, total_price, currency, receipt_id, order_url
         
@@ -1915,7 +1931,7 @@ async def result_handler():
             cc = result['cc']
             full_cc = result['full_cc']
             status = result['status']
-            response = result['response']
+            response = normalize_response_text(result.get('response'))
             gateway = result['gateway']
             price = result['price']
             currency = result['currency']
