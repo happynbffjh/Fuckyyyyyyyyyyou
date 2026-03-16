@@ -1796,7 +1796,7 @@ async def update_task_progress(message_id, stats, start_time=None):
 • ✅ Live: {live}
 • ❌ Dead: {dead}
 • 💎 Hits: {hits}
-• 🔐 OTP: {otp}
+• 🔐 3DS: {otp}
 • 🧩 Captcha: {captcha}
 • 🚫 Failed: {failed}
 ━━━━━━━━━━━━━━
@@ -1947,7 +1947,7 @@ async def result_handler():
             # Check for HIT status
             if response in ['ORDER_PLACED', 'ProcessedReceipt', 'CHARGED'] or any(k in str(response) for k in success_keys):
                 hit_status = "hit"
-            # Check for OTP status
+            # Check for 3DS/OTP status
             elif response in ['OTP_REQUIRED', 'ACTION_REQUIRED', '2FACTOR'] or any(k in str(response) for k in twofactor_keys):
                 hit_status = "otp"
             elif "CAPTCHA_REQUIRED" in str(response).upper():
@@ -1975,8 +1975,8 @@ async def result_handler():
                 status_emoji = "🟢"
                 status_text = "HIT"
             elif hit_status == "otp":
-                status_emoji = "🟡"
-                status_text = "OTP"
+                status_emoji = "🟢"
+                status_text = "3DS"
             elif hit_status == "live":
                 status_emoji = "🟢"
                 status_text = "LIVE"
@@ -2030,7 +2030,7 @@ by @still_alivenow"""
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True
                     )
-                    if HIT_CHANNEL and hit_status in ['hit', 'live']:
+                    if HIT_CHANNEL and hit_status in ['hit', 'live', 'otp']:
                         try:
                             await asyncio.sleep(0.3)
                             await app.send_message(
@@ -2067,7 +2067,7 @@ by @still_alivenow"""
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True
                         )
-                        if HIT_CHANNEL and hit_status in ['hit', 'live']:
+                        if HIT_CHANNEL and hit_status in ['hit', 'live', 'otp']:
                             try:
                                 await asyncio.sleep(0.3)
                                 await app.send_message(
@@ -2190,7 +2190,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         session['choice'] = choice
         session['event'].set()
 
-        choice_text = "Yes (HIT + LIVE + OTP)" if choice == 'yes' else "No (HIT only)"
+        choice_text = "Yes (HIT + LIVE + 3DS)" if choice == 'yes' else "No (HIT only)"
         await callback_query.answer(f"Selected: {choice_text}")
 
         try:
@@ -2887,7 +2887,7 @@ async def mchk_command(client, message):
     finally:
         mchk_pref_sessions.pop(pref_id, None)
 
-    selected_text = "Yes (HIT + LIVE + OTP)" if send_live_otp else "No (HIT only)"
+    selected_text = "Yes (HIT + LIVE + 3DS)" if send_live_otp else "No (HIT only)"
     try:
         await pref_message.edit_text(
             f"{pref_text}\n\n✅ Selected: {selected_text}",
@@ -2951,7 +2951,7 @@ async def mchk_command(client, message):
 • ✅ Live: 0
 • ❌ Dead: 0
 • 💎 Hits: 0
-• 🔐 OTP: 0
+• 🔐 3DS: 0
 • 🧩 Captcha: 0
 • 🚫 Failed: 0
 ━━━━━━━━━━━━━━
@@ -3189,7 +3189,7 @@ CREATED BY @still_alivenow"""
             InlineKeyboardButton(f"LIVE 0", callback_data="ignore")
         ],
         [
-            InlineKeyboardButton(f"OTP 0", callback_data="ignore"),
+            InlineKeyboardButton(f"3DS 0", callback_data="ignore"),
             InlineKeyboardButton(f"FAILED 0", callback_data="ignore")
         ]
     ])
