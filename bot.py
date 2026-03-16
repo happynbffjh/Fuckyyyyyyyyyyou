@@ -1508,29 +1508,64 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                 if is_captcha_required(resp_text):
                     return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency, receipt_id, order_url
 
-                formattedCard = " ".join([cc[i:i+4] for i in range(0, len(cc), 4)])
+                token = None
+                raw_card = str(cc).replace(" ", "")
                 payload = {
                     "credit_card": {
-                        "month": mes,
+                        "month": int(mes),
                         "name": f"{firstName} {lastName}",
-                        "number": formattedCard,
-                        "verification_value": cvv,
-                        "year": ano,
-                        "start_month": "",
-                        "start_year": "",
-                        "issue_number": ""
+                        "number": raw_card,
+                        "verification_value": str(cvv),
+                        "year": int(ano)
                     },
-                    "payment_session_scope": f"www.{urlparse(url).netloc}"
+                    "payment_session_scope": urlparse(url).netloc
                 }
-                
-                async with session.post('https://deposit.shopifycs.com/sessions', json=payload, proxy=proxy) as response:
-                    try:
+
+                # Prefer Shopify PCI tokenization flow from standalone tester.
+                pci_headers = {
+                    "Origin": "https://checkout.pci.shopifyinc.com",
+                    "Referer": "https://checkout.pci.shopifyinc.com/",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Sec-Fetch-Site": "cross-site",
+                    "Sec-Fetch-Mode": "cors"
+                }
+                try:
+                    async with session.post(
+                        "https://checkout.pci.shopifyinc.com/sessions",
+                        json=payload,
+                        headers=pci_headers,
+                        proxy=proxy
+                    ) as response:
                         token_data = await response.json(content_type=None)
                         token = token_data.get('id')
-                        if not token:
-                            return False, 'Unable to get payment token', gateway, total_price, currency, receipt_id, order_url
-                    except Exception as e:
-                        return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency, receipt_id, order_url
+                except Exception:
+                    token = None
+
+                # Fallback to legacy endpoint when PCI endpoint fails.
+                if not token:
+                    legacy_payload = {
+                        "credit_card": {
+                            "month": int(mes),
+                            "name": f"{firstName} {lastName}",
+                            "number": " ".join([raw_card[i:i+4] for i in range(0, len(raw_card), 4)]),
+                            "verification_value": str(cvv),
+                            "year": int(ano),
+                            "start_month": "",
+                            "start_year": "",
+                            "issue_number": ""
+                        },
+                        "payment_session_scope": f"www.{urlparse(url).netloc}"
+                    }
+                    async with session.post('https://deposit.shopifycs.com/sessions', json=legacy_payload, proxy=proxy) as response:
+                        try:
+                            token_data = await response.json(content_type=None)
+                            token = token_data.get('id')
+                        except Exception as e:
+                            return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency, receipt_id, order_url
+
+                if not token:
+                    return False, 'Unable to get payment token', gateway, total_price, currency, receipt_id, order_url
 
                 params = {'operationName': 'SubmitForCompletion'}
                 
@@ -1662,17 +1697,42 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     'operationName': 'SubmitForCompletion'
                 }
 
-                response, text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                    session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
-                )
-                
-                if is_captcha_required(text):
-                    return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency, receipt_id, order_url
-                
-                if "Your order total has changed." in text:
-                    return False, "Site not supported", gateway, total_price, currency, receipt_id, order_url
-                if "The requested payment method is not available." in text:
-                    return False, "Payment method not available", gateway, total_price, currency, receipt_id, order_url
+                text = ""
+                for submit_try in range(3):
+                    response, text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                        session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
+                    )
+
+                    if is_captcha_required(text):
+                        return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency, receipt_id, order_url
+
+                    if "The requested payment method is not available." in text:
+                        return False, "Payment method not available", gateway, total_price, currency, receipt_id, order_url
+
+                    stale_delivery = False
+                    stale_reason = ""
+                    if "Your order total has changed." in text:
+                        stale_delivery = True
+                        stale_reason = "order total changed"
+                    else:
+                        try:
+                            preview_json = json.loads(text)
+                            preview_submit = preview_json.get('data', {}).get('submitForCompletion', {})
+                            if preview_submit.get('__typename') == 'SubmitRejected':
+                                for err in preview_submit.get('errors', []):
+                                    emsg = (err.get('localizedMessage') or err.get('code') or '').lower()
+                                    if any(k in emsg for k in ['delivery', 'shipping', 'verify']):
+                                        stale_delivery = True
+                                        stale_reason = emsg or "delivery stale"
+                                        break
+                        except Exception:
+                            pass
+
+                    if stale_delivery and submit_try < 2:
+                        logger.info(f"Retrying submit for stale delivery terms (attempt {submit_try + 1}/3): {stale_reason}")
+                        await asyncio.sleep(0.5)
+                        continue
+                    break
                 
                 try:
                     resp_json = json.loads(text)
