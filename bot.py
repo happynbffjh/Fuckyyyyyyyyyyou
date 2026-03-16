@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import json
+import html
 import re
 import random
 import argparse
@@ -1956,9 +1957,10 @@ async def result_handler():
             receipt_text = ""
             if receipt_id:
                 if order_url and order_url != 'N/A' and order_url:
-                    receipt_text = f"🧾 <a href='{order_url}'>View Order</a>"
+                    safe_order_url = html.escape(str(order_url), quote=True)
+                    receipt_text = f"🧾 <a href='{safe_order_url}'>View Order</a>"
                 else:
-                    receipt_text = f"🧾 Receipt: <code>{receipt_id}</code>"
+                    receipt_text = f"🧾 Receipt: <code>{html.escape(str(receipt_id))}</code>"
             
             # Format message with click-to-copy card
             if hit_status == "hit":
@@ -1970,6 +1972,9 @@ async def result_handler():
             elif hit_status == "live":
                 status_emoji = "🟢"
                 status_text = "LIVE"
+            elif hit_status == "captcha":
+                status_emoji = "🟠"
+                status_text = "CAPTCHA"
             else:
                 status_emoji = "🔴"
                 status_text = "DECLINED"
@@ -1979,18 +1984,31 @@ async def result_handler():
                 formatted_price = round(float(price), 2)
             except (ValueError, TypeError):
                 formatted_price = price
+
+            safe_full_cc = html.escape(str(full_cc))
+            safe_response = html.escape(str(response))
+            safe_bin = html.escape(str(bin_info.get('bin', 'N/A')))
+            safe_brand = html.escape(str(bin_info.get('brand', 'UNKNOWN')))
+            safe_type = html.escape(str(bin_info.get('type', '')))
+            safe_level = html.escape(str(bin_info.get('level', '')))
+            safe_bank = html.escape(str(bin_info.get('bank', 'UNKNOWN')))
+            safe_country_flag = html.escape(str(bin_info.get('country_flag', '🏳️')))
+            safe_country_name = html.escape(str(bin_info.get('country_name', 'UNKNOWN')))
+            safe_site_name = html.escape(str(site_name))
+            safe_currency = html.escape(str(currency))
+            safe_first_name = html.escape(str(first_name))
             
             formatted_message = f"""{status_emoji} {status_text}
 
-💳 Card: <code>{full_cc}</code>
-🔐 Code: {response}
-🎫 BIN: {bin_info.get('bin', 'N/A')} [{bin_info.get('brand', 'UNKNOWN')}] {bin_info.get('type', '')} ({bin_info.get('level', '')}) - {bin_info.get('bank', 'UNKNOWN')}
-🌍 Country: {bin_info.get('country_flag', '🏳️')} {bin_info.get('country_name', 'UNKNOWN')}
-🌐 Site: {site_name}
-💰 Amount: {formatted_price} {currency}
+💳 Card: <code>{safe_full_cc}</code>
+🔐 Code: {safe_response}
+🎫 BIN: {safe_bin} [{safe_brand}] {safe_type} ({safe_level}) - {safe_bank}
+🌍 Country: {safe_country_flag} {safe_country_name}
+🌐 Site: {safe_site_name}
+💰 Amount: {formatted_price} {safe_currency}
 {receipt_text}
 ⚡ Time: {process_time}s
-👤 User: {first_name}
+👤 User: {safe_first_name}
 
 by @still_alivenow"""
             
@@ -2014,6 +2032,16 @@ by @still_alivenow"""
                         )
                 except Exception as e:
                     logger.error(f"Error sending message to user {user_id}: {e}")
+                    # Fallback to plain text to avoid HTML parsing failures.
+                    try:
+                        plain_message = re.sub(r"<[^>]+>", "", formatted_message)
+                        await app.send_message(
+                            chat_id=user_id,
+                            text=plain_message,
+                            disable_web_page_preview=True
+                        )
+                    except Exception as send_fallback_error:
+                        logger.error(f"Fallback send failed for user {user_id}: {send_fallback_error}")
             
             elif task_type in ['mchk', 'chksite']:
                 should_send = hit_status in ['hit', 'live', 'otp']
@@ -2039,6 +2067,16 @@ by @still_alivenow"""
                     
                     except Exception as e:
                         logger.error(f"Error sending hit message to user {user_id}: {e}")
+                        # Fallback to plain text to avoid HTML parsing failures.
+                        try:
+                            plain_message = re.sub(r"<[^>]+>", "", formatted_message)
+                            await app.send_message(
+                                chat_id=user_id,
+                                text=plain_message,
+                                disable_web_page_preview=True
+                            )
+                        except Exception as send_fallback_error:
+                            logger.error(f"Fallback send failed for mchk user {user_id}: {send_fallback_error}")
             
             # Update progress for batch tasks
             if task_type in ['mchk', 'chksite'] and original_message:
