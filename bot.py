@@ -523,6 +523,17 @@ def normalize_response_text(response):
     text = re.sub(r"\s+", " ", text).strip()
     return text if text else "UNKNOWN_ERROR"
 
+def sanitize_for_log(text):
+    """Redact sensitive credentials from log strings."""
+    if text is None:
+        return ""
+    value = str(text)
+    # Redact URL credentials: http://user:pass@host:port -> http://***:***@host:port
+    value = re.sub(r'((?:https?://))([^:/\s@]+):([^@\s/]+)@', r'\1***:***@', value)
+    # Redact raw proxy credentials: host:port:user:pass -> host:port:***:***
+    value = re.sub(r'(\b[^:\s]+:\d{2,5}):[^:\s]+:[^:\s]+', r'\1:***:***', value)
+    return value
+
 def parse_cc_string(cc_string):
     parts = cc_string.split('|')
     if len(parts) != 4:
@@ -1240,7 +1251,7 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                             if available_proxies:
                                 proxy_str = random.choice(available_proxies)
                                 proxy = parse_proxy(proxy_str)
-                                retry_reason = normalize_response_text(resp_text)[:180]
+                                retry_reason = sanitize_for_log(normalize_response_text(resp_text))[:180]
                                 logger.info(f"Retrying with new proxy for user {user_id} (reason: {retry_reason})")
                                 continue
                     return False, f"Request failed: {resp_text}", gateway, total_price, currency, receipt_id, order_url
@@ -1688,7 +1699,7 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     if available_proxies:
                         proxy_str = random.choice(available_proxies)
                         proxy = parse_proxy(proxy_str)
-                        retry_reason = normalize_response_text(f"{type(e).__name__}: {e}")[:180]
+                        retry_reason = sanitize_for_log(normalize_response_text(f"{type(e).__name__}: {e}"))[:180]
                         logger.info(f"Retrying after exception with new proxy for user {user_id} (reason: {retry_reason})")
                         continue
             return False, f"Error Processing Card: {str(e)}", gateway, total_price, currency, receipt_id, order_url
