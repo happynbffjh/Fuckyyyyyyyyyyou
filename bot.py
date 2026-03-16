@@ -1760,7 +1760,7 @@ async def save_working_site(user_id, site_url, product_info):
         return False, str(e)
 
 async def update_task_progress(message_id, stats, start_time=None):
-    """Update task progress message with buttons"""
+    """Update task progress message with inline status text."""
     try:
         if message_id not in task_messages:
             return
@@ -1780,8 +1780,11 @@ async def update_task_progress(message_id, stats, start_time=None):
         duration_seconds = round(elapsed.total_seconds(), 1)
         total_cards = stats.get('total', 0)
         processed = stats.get('checked', 0)
+        otp = stats.get('otp', 0)
+        captcha = stats.get('captcha', 0)
         live = stats.get('live', 0)
-        dead = stats.get('failed', 0)
+        failed = stats.get('failed', 0)
+        dead = failed
         hits = stats.get('hit', 0)
 
         progress_text = f"""💳 <b>CARD PROCESSOR</b>
@@ -1793,35 +1796,19 @@ async def update_task_progress(message_id, stats, start_time=None):
 • ✅ Live: {live}
 • ❌ Dead: {dead}
 • 💎 Hits: {hits}
-• 🧩 Captcha: {stats.get('captcha', 0)}
+• 🔐 OTP: {otp}
+• 🧩 Captcha: {captcha}
+• 🚫 Failed: {failed}
 ━━━━━━━━━━━━━━
 ⏱️ Duration: {duration_seconds}s
 👤 {user_name}"""
 
-        # Create buttons
-        keyboard_rows = [
-            [
-                InlineKeyboardButton(f"TOTAL {stats.get('total', 0)}", callback_data="ignore"),
-                InlineKeyboardButton(f"CHECKED {stats.get('checked', 0)}", callback_data="ignore")
-            ],
-            [
-                InlineKeyboardButton(f"HIT {stats.get('hit', 0)}", callback_data="ignore"),
-                InlineKeyboardButton(f"LIVE {stats.get('live', 0)}", callback_data="ignore")
-            ],
-            [
-                InlineKeyboardButton(f"OTP {stats.get('otp', 0)}", callback_data="ignore"),
-                InlineKeyboardButton(f"CAPTCHA {stats.get('captcha', 0)}", callback_data="ignore"),
-                InlineKeyboardButton(f"FAILED {stats.get('failed', 0)}", callback_data="ignore")
-            ]
-        ]
-
+        keyboard = None
         batch_id = stats.get('batch_id')
         if batch_id and processed < total_cards:
-            keyboard_rows.append([
+            keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
-            ])
-
-        keyboard = InlineKeyboardMarkup(keyboard_rows)
+            ]])
         
         try:
             await message.edit_text(
@@ -2964,28 +2951,15 @@ async def mchk_command(client, message):
 • ✅ Live: 0
 • ❌ Dead: 0
 • 💎 Hits: 0
+• 🔐 OTP: 0
 • 🧩 Captcha: 0
+• 🚫 Failed: 0
 ━━━━━━━━━━━━━━
 ⏱️ Duration: 0.0s
 👤 {user.first_name}"""
 
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"TOTAL {len(accepted_cards)}", callback_data="ignore"),
-            InlineKeyboardButton("CHECKED 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton("HIT 0", callback_data="ignore"),
-            InlineKeyboardButton("LIVE 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton("OTP 0", callback_data="ignore"),
-            InlineKeyboardButton("CAPTCHA 0", callback_data="ignore"),
-            InlineKeyboardButton("FAILED 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
-        ]
+        [InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")]
     ])
     
     processing_msg = await message.reply_text(
