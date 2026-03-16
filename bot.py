@@ -100,7 +100,7 @@ task_users = {}    # message_id -> user_id
 product_cache = {} # normalized_site -> {"data": product_info, "expires_at": epoch}
 bin_cache = {}     # bin -> {"data": bin_info, "expires_at": epoch}
 user_name_cache = {}  # user_id -> first_name
-user_display_cache = {}  # user_id -> @username or first_name
+user_display_cache = {}  # user_id -> display name (full/first name)
 mchk_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
 mchk_captcha_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
 user_active_mchk_batches = defaultdict(set)  # user_id -> set(batch_id)
@@ -612,12 +612,49 @@ def parse_cc_string(cc_string):
     parts = cc_string.split('|')
     if len(parts) != 4:
         raise ValueError("Invalid CC format. Use: CC|MM|YYYY|CVV")
+
+    cc = re.sub(r"\D", "", parts[0].strip())
+    mm_raw = parts[1].strip()
+    yy_raw = parts[2].strip()
+    cvv = re.sub(r"\D", "", parts[3].strip())
+
+    if not cc or len(cc) < 12 or len(cc) > 19:
+        raise ValueError("Invalid card number")
+
+    if not mm_raw.isdigit():
+        raise ValueError("Invalid month")
+    mm_i = int(mm_raw)
+    if mm_i < 1 or mm_i > 12:
+        raise ValueError("Month must be between 01 and 12")
+    mm = f"{mm_i:02d}"
+
+    if not yy_raw.isdigit():
+        raise ValueError("Invalid year")
+    if len(yy_raw) == 2:
+        yy = f"20{yy_raw}"
+    elif len(yy_raw) == 4:
+        yy = yy_raw
+    else:
+        raise ValueError("Year must be YY or YYYY")
+
+    if len(cvv) < 3 or len(cvv) > 4:
+        raise ValueError("Invalid CVV")
+
     return {
-        'cc': parts[0].strip(),
-        'mes': parts[1].strip(),
-        'ano': parts[2].strip(),
-        'cvv': parts[3].strip()
+        'cc': cc,
+        'mes': mm,
+        'ano': yy,
+        'cvv': cvv
     }
+
+def build_user_full_name(user_obj):
+    """Build a readable full name from Telegram user object."""
+    if not user_obj:
+        return "User"
+    first = (getattr(user_obj, "first_name", "") or "").strip()
+    last = (getattr(user_obj, "last_name", "") or "").strip()
+    full = f"{first} {last}".strip()
+    return full or first or "User"
 
 def parse_cc_from_any_line(line):
     """Extract and normalize CC data from mixed line formats."""
@@ -1000,27 +1037,22 @@ async def get_cached_user_display_name(user_id):
     if cached_display:
         return cached_display
 
-    first_name = 'User'
-    username = None
+    display_name = 'User'
     if DB_AVAILABLE:
         try:
             user = await users_col.find_one({'user_id': user_id})
             if user:
-                first_name = user.get('first_name', 'User')
-                username = user.get('username')
+                display_name = user.get('full_name') or user.get('first_name', 'User')
         except Exception as e:
             set_db_unavailable(e)
             user = get_memory_user_doc(user_id)
             if user:
-                first_name = user.get('first_name', 'User')
-                username = user.get('username')
+                display_name = user.get('full_name') or user.get('first_name', 'User')
     else:
         user = get_memory_user_doc(user_id)
         if user:
-            first_name = user.get('first_name', 'User')
-            username = user.get('username')
+            display_name = user.get('full_name') or user.get('first_name', 'User')
 
-    display_name = f"@{username}" if username else (first_name or 'User')
     user_display_cache[user_id] = display_name
     return display_name
 
@@ -2737,15 +2769,17 @@ async def get_random_site(user_id):
     
     return None
 
-async def save_user(user_id, first_name, username=None):
+async def save_user(user_id, first_name, username=None, full_name=None):
     """Save or update user in database"""
-    user_name_cache[user_id] = first_name
-    user_display_cache[user_id] = f"@{username}" if username else (first_name or 'User')
+    resolved_name = (full_name or first_name or 'User').strip()
+    user_name_cache[user_id] = resolved_name
+    user_display_cache[user_id] = resolved_name
     now_ts = utcnow()
     existing_mem = mem_users.get(user_id, {})
     mem_users[user_id] = {
         'user_id': user_id,
-        'first_name': first_name,
+        'first_name': resolved_name,
+        'full_name': resolved_name,
         'username': username,
         'last_seen': now_ts,
         'joined_at': existing_mem.get('joined_at', now_ts),
@@ -2758,7 +2792,8 @@ async def save_user(user_id, first_name, username=None):
                 {'user_id': user_id},
                 {
                     '$set': {
-                        'first_name': first_name,
+                        'first_name': resolved_name,
+                        'full_name': resolved_name,
                         'username': username,
                         'last_seen': now_ts
                     },
@@ -2849,7 +2884,7 @@ async def get_user_stats(user_id):
 async def start_command(client, message):
     """Start command handler"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     welcome_text = f"""👋 Welcome {user.first_name}!
 
@@ -2892,7 +2927,7 @@ Dead sites are automatically removed."""
 async def chk_command(client, message):
     """Single card check command"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Check if command has arguments or is reply
     if len(message.command) > 1:
@@ -2953,7 +2988,7 @@ async def chk_command(client, message):
 async def mchk_command(client, message):
     """Mass card check command (up to MAX_MASS_CHECK_CARDS cards)"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Get cards from command or reply
     cards = []
@@ -3220,7 +3255,7 @@ async def mchk_command(client, message):
 async def clean_command(client, message):
     """Clean CC lines from replied text/txt and return normalized txt."""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
 
     lines = []
     tmp_file = None
@@ -3277,7 +3312,7 @@ async def clean_command(client, message):
 async def stopmchk_command(client, message):
     """Stop all active mass-check batches for user."""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
 
     cancel_info = cancel_user_mchk_batches(user.id)
     cancelled_batches = cancel_info.get('cancelled_batches', [])
@@ -3314,7 +3349,7 @@ async def stopmchk_command(client, message):
 async def chksite_command(client, message):
     """Test sites and find working ones"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Get sites from command or reply
     sites = []
@@ -3397,6 +3432,21 @@ async def chksite_command(client, message):
                 is_working, message_text, product_info = await test_site_connection(site_to_check, proxy)
 
             if is_working:
+                # Hard guard for price range during site check.
+                try:
+                    p = float(str((product_info or {}).get('price', '0')).replace(',', '').strip())
+                except Exception:
+                    return "skipped", site_to_check, product_info, "Invalid product price"
+
+                if p < MIN_SITE_PRODUCT_PRICE:
+                    return "skipped", site_to_check, product_info, (
+                        f"Cheapest product ${p:.2f} is below ${MIN_SITE_PRODUCT_PRICE:.2f}"
+                    )
+                if p > MAX_SITE_PRODUCT_PRICE:
+                    return "skipped", site_to_check, product_info, (
+                        f"Cheapest product ${p:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
+                    )
+
                 saved, save_msg = await save_working_site(user.id, site_to_check, product_info)
                 if saved:
                     return "hit", site_to_check, product_info, None
@@ -3473,7 +3523,7 @@ Check /showsites to see saved working sites."""
 async def addproxy_command(client, message):
     """Add proxy command"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Get proxies from command or reply
     proxies = []
@@ -3608,7 +3658,7 @@ async def showproxy_command(client, message):
 async def addsite_command(client, message):
     """Check site and get cheapest product"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Get site from command
     if len(message.command) > 1:
@@ -3719,7 +3769,7 @@ async def showsites_command(client, message):
 async def rmvsite_command(client, message):
     """User command: Remove your own sites"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Parse command arguments
     args = message.text.split()
