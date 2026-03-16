@@ -3581,19 +3581,52 @@ async def addproxy_command(client, message):
             ok, reason = await validate_proxy_connection(proxy_value)
             return proxy_value, ok, reason
 
-    proxy_checks = await asyncio.gather(*[_validate_one(proxy_value) for proxy_value in normalized_proxies])
+    checked = 0
+    reachable_proxies = []
+    unreachable = []
+    total_to_check = len(normalized_proxies)
+    validate_tasks = [asyncio.create_task(_validate_one(proxy_value)) for proxy_value in normalized_proxies]
+
+    for done_task in asyncio.as_completed(validate_tasks):
+        proxy_value, ok, reason = await done_task
+        checked += 1
+        if ok:
+            reachable_proxies.append(proxy_value)
+        else:
+            unreachable.append((proxy_value, reason))
+
+        if checked == total_to_check or checked == 1 or checked % 5 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"🔄 Validating proxies...\n"
+                    f"Checked: {checked}/{total_to_check}\n"
+                    f"Reachable: {len(reachable_proxies)}\n"
+                    f"Unreachable: {len(unreachable)}\n"
+                    f"Invalid format: {len(invalid_proxies)}",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
 
     added = 0
     db_failed = 0
-    unreachable = []
-    for proxy_value, ok, reason in proxy_checks:
-        if not ok:
-            unreachable.append((proxy_value, reason))
-            continue
+    for idx, proxy_value in enumerate(reachable_proxies, 1):
         if await add_user_proxy(user.id, proxy_value):
             added += 1
         else:
             db_failed += 1
+
+        if idx == len(reachable_proxies) or idx == 1 or idx % 10 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"💾 Saving validated proxies...\n"
+                    f"Saved: {idx}/{len(reachable_proxies)}\n"
+                    f"Added: {added}\n"
+                    f"DB failed: {db_failed}",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
 
     details = [
         "✅ Proxy validation complete!",
@@ -3748,8 +3781,8 @@ async def showsites_command(client, message):
     sites_text += f"\nTo remove sites, use:\n"
     sites_text += "`/rmvsite` - Show removal options"
     
-    # If list is too long, send as file
-    if len(sites_text) > 4000:
+    # Send as file when site count is large (30+) or text is too long.
+    if len(sites_list) >= 30 or len(sites_text) > 4000:
         file_path = f"sites_{user.id}.txt"
         async with aiofiles.open(file_path, 'w') as f:
             for site_entry in sites_list:
@@ -3759,7 +3792,7 @@ async def showsites_command(client, message):
                     await f.write(f"{site_entry}\n")
         await message.reply_document(
             file_path,
-            caption=f"📋 Your Working Sites ({len(sites_list)} sites)"
+            caption=f"📋 Your Working Sites ({len(sites_list)} sites, sent as file)"
         )
         os.remove(file_path)
     else:
