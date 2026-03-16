@@ -581,6 +581,101 @@ def format_response_for_display(response_text):
 
     return normalized
 
+def run_gateway_keycheck(submit_resp, receipt_resp=None):
+    """Keycheck logic aligned with provided standalone tester."""
+    response_blob = json.dumps(submit_resp or {}, default=str)
+    if receipt_resp:
+        response_blob += json.dumps(receipt_resp or {}, default=str)
+    response_lower = response_blob.lower()
+
+    submit_result = (submit_resp or {}).get('data', {}).get('submitForCompletion', {}) or {}
+    submit_type = submit_result.get('__typename', '')
+
+    receipt = submit_result.get('receipt', {}) or {}
+    if receipt_resp:
+        receipt = (receipt_resp or {}).get('data', {}).get('receipt', {}) or receipt
+    receipt_type = receipt.get('__typename', '')
+
+    error_msg = ""
+    error_code = ""
+    if receipt_type == 'FailedReceipt':
+        processing_error = receipt.get('processingError', {}) or {}
+        error_code = processing_error.get('code', '') or ''
+        error_msg = processing_error.get('messageUntranslated', '') or ''
+    elif submit_type == 'SubmitRejected':
+        errors = submit_result.get('errors', []) or []
+        if errors:
+            error_msg = errors[0].get('localizedMessage', '') or ''
+            error_code = errors[0].get('code', '') or ''
+    elif submit_type == 'SubmitFailed':
+        error_msg = submit_result.get('reason', '') or ''
+
+    if error_code and "CAPTCHA" in error_code.upper():
+        return {'status': 'CAPTCHA', 'message': 'CAPTCHA_REQUIRED'}
+
+    if any(k in response_lower for k in [
+        "captcha is required",
+        "completing a captcha is required",
+        "complete a captcha",
+        "verify you are human",
+        "human verification required",
+        "robot check",
+        "captcha verification",
+        "captcha_required"
+    ]):
+        return {'status': 'CAPTCHA', 'message': 'CAPTCHA_REQUIRED'}
+
+    if receipt_type == 'ProcessedReceipt' or any(k in response_blob for k in success_keys):
+        return {
+            'status': 'CHARGED',
+            'message': 'APPROVED',
+            'receipt_id': receipt.get('id'),
+            'order_url': receipt.get('orderStatusPageUrl') or receipt.get('redirectUrl')
+        }
+
+    if receipt_type == 'ActionRequiredReceipt' or any(k in response_blob for k in twofactor_keys):
+        return {'status': '2FACTOR', 'message': '3DS_REQUIRED'}
+
+    if any(k in response_blob for k in [
+        "Security code was not matched by the processor",
+        "INVALID_CVC",
+        "invalid_cvc",
+        "cvc_check",
+        "VERIFICATION_VALUE_INVALID_FOR_CARD_TYPE",
+        "PAYMENTS_CREDIT_CARD_VERIFICATION_VALUE_INVALID"
+    ]):
+        return {'status': 'CCN', 'message': 'CVV_MISMATCH'}
+
+    if any(k in response_blob for k in [
+        "ZIP code does not match billing address",
+        "Street address and postal code do not match"
+    ]):
+        return {'status': 'RETRY', 'message': 'ADDRESS_MISMATCH'}
+
+    if any(k in response_lower for k in [
+        "delivery details may have changed",
+        "verify your shipping method",
+        "shipping method and try again",
+        "delivery has changed"
+    ]):
+        return {'status': 'RETRY', 'message': 'DELIVERY_STALE'}
+
+    if submit_type == 'Throttled':
+        return {'status': 'THROTTLED', 'message': 'RATE_LIMITED'}
+
+    if receipt_type == 'FailedReceipt' or any(k in response_blob for k in fail_keys):
+        if "expired" in response_lower:
+            return {'status': 'EXPIRED', 'message': error_msg or 'CARD_EXPIRED'}
+        if "insufficient" in response_lower or "nsf" in response_lower:
+            return {'status': 'NSF', 'message': error_msg or 'INSUFFICIENT_FUNDS'}
+        return {'status': 'DECLINED', 'message': error_msg or error_code or 'CARD_DECLINED'}
+
+    if submit_type in ['ProcessingReceipt', 'WaitingReceipt'] or receipt_type in ['ProcessingReceipt', 'WaitingReceipt']:
+        return {'status': 'RETRY', 'message': 'PROCESSING_TIMEOUT'}
+
+    fallback_message = error_msg or error_code or submit_type or receipt_type or 'NO_RESPONSE'
+    return {'status': 'UNKNOWN', 'message': fallback_message}
+
 def should_retry_mchk_last_response(success, response_text):
     """Retry only transient/unfinished mass-check failures."""
     if success:
@@ -1736,123 +1831,70 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                 
                 try:
                     resp_json = json.loads(text)
-                    submit_data = resp_json.get('data', {}).get('submitForCompletion', {})
-                    
-                    if not submit_data:
-                        errors = resp_json.get('errors', [])
-                        if errors:
-                            for error in errors:
-                                code = error.get('code')
-                                if code:
-                                    return False, code, gateway, total_price, currency, receipt_id, order_url
-                        return False, "Empty submit response", gateway, total_price, currency, receipt_id, order_url
-                    
-                    result_type = submit_data.get('__typename', '')
-                    
-                    if result_type in ['SubmitSuccess', 'SubmittedForCompletion', 'SubmitAlreadyAccepted']:
-                        receipt = submit_data.get('receipt', {})
-                        if receipt:
-                            receipt_type = receipt.get('__typename', '')
-                            
-                            if receipt_type == 'ProcessedReceipt':
-                                receipt_id = receipt.get('id')
-                                order_url = receipt.get('orderStatusPageUrl')
-                                return True, "ORDER_PLACED", gateway, total_price, currency, receipt_id, order_url
-                            
-                            rid = receipt.get('id')
-                        else:
-                            return False, "SubmitSuccess but no receipt", gateway, total_price, currency, receipt_id, order_url
-                    
-                    elif result_type == 'SubmitFailed':
-                        reason = submit_data.get('reason', 'Unknown reason')
-                        return False, extract_clean_response(reason), gateway, total_price, currency, receipt_id, order_url
-                    
-                    elif result_type == 'SubmitRejected':
-                        errors = submit_data.get('errors', [])
-                        if errors:
-                            for error in errors:
-                                code = error.get('code')
-                                if code:
-                                    return False, code, gateway, total_price, currency, receipt_id, order_url
-                        return False, "Submit Rejected", gateway, total_price, currency, receipt_id, order_url
-                    
-                    elif result_type == 'Throttled':
-                        return False, "Throttled", gateway, total_price, currency, receipt_id, order_url
-                    
-                    receipt = submit_data.get('receipt', {})
-                    if not receipt:
-                        return False, "No receipt in submit response", gateway, total_price, currency, receipt_id, order_url
-                    
-                    rid = receipt.get('id')
-                    if not rid:
-                        return False, "No receipt ID", gateway, total_price, currency, receipt_id, order_url
-                    
                 except json.JSONDecodeError:
                     return False, f"Invalid JSON in submit response: {text[:100]}", gateway, total_price, currency, receipt_id, order_url
                 except Exception as e:
                     return False, f"Error parsing submit: {str(e)}", gateway, total_price, currency, receipt_id, order_url
 
-                params = {'operationName': 'PollForReceipt'}
-                poll_json_data = {
-                    'query': QUERY_POLL,
-                    'variables': {'receiptId': rid, 'sessionToken': sst},
-                    'operationName': 'PollForReceipt'
-                }
+                submit_data = resp_json.get('data', {}).get('submitForCompletion', {}) or {}
+                rid = None
+                receipt = submit_data.get('receipt', {}) or {}
+                if receipt:
+                    rid = receipt.get('id')
+                    receipt_id = receipt_id or rid
+                    order_url = order_url or receipt.get('orderStatusPageUrl') or receipt.get('redirectUrl')
 
-                await asyncio.sleep(1.5)
-                
                 receipt_resp_json = None
-                final_text = ""
-                for i in range(4):
-                    response, final_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                        session, graphql_url, params, headers, poll_json_data,
-                        checkout_url, max_retries=1
-                    )
-                    
-                    if is_captcha_required(final_text):
-                        return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, receipt_id, order_url
-                    
-                    try:
-                        receipt_resp_json = json.loads(final_text)
-                        receipt_data = receipt_resp_json.get('data', {}).get('receipt', {})
+                receipt_type = receipt.get('__typename', '')
+                if rid and receipt_type in ['ProcessingReceipt', 'WaitingReceipt']:
+                    params = {'operationName': 'PollForReceipt'}
+                    poll_json_data = {
+                        'query': QUERY_POLL,
+                        'variables': {'receiptId': rid, 'sessionToken': sst},
+                        'operationName': 'PollForReceipt'
+                    }
+                    for _ in range(10):
+                        await asyncio.sleep(1.5)
+                        response, final_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                            session, graphql_url, params, headers, poll_json_data,
+                            checkout_url, max_retries=1
+                        )
+                        if is_captcha_required(final_text):
+                            return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, receipt_id, order_url
+                        try:
+                            receipt_resp_json = json.loads(final_text)
+                            poll_receipt = receipt_resp_json.get('data', {}).get('receipt', {}) or {}
+                            poll_type = poll_receipt.get('__typename', '')
+                            if poll_type in ['ProcessedReceipt', 'FailedReceipt', 'ActionRequiredReceipt']:
+                                receipt_id = poll_receipt.get('id') or receipt_id
+                                order_url = poll_receipt.get('orderStatusPageUrl') or poll_receipt.get('redirectUrl') or order_url
+                                break
+                        except Exception:
+                            continue
 
-                        if receipt_data:
-                            typename = receipt_data.get('__typename', '')
-                            if typename == 'ProcessedReceipt' or any(k in final_text for k in success_keys):
-                                receipt_id = receipt_data.get('id')
-                                order_url = receipt_data.get('orderStatusPageUrl')
-                                return True, "ORDER_PLACED", gateway, total_price, currency, receipt_id, order_url
-                            elif typename == 'ActionRequiredReceipt' or any(k in final_text for k in twofactor_keys):
-                                return True, "OTP_REQUIRED", gateway, total_price, currency, receipt_id, order_url
-                            
-                            elif typename == 'INCORRECT_CVC' or any(k in final_text for k in ccn_keys):
-                                return True, "INCORRECT_CVC", gateway, total_price, currency, receipt_id, order_url
-                            
-                            elif typename == 'INSUFFICIENT_FUNDS':
-                                return True, "INSUFFICIENT_FUNDS", gateway, total_price, currency, receipt_id, order_url
-                                
-                            elif typename == 'FailedReceipt' or any(k in final_text for k in fail_keys):
-                                error = receipt_data.get('processingError', {})
-                                code = error.get('code', 'UNKNOWN_ERROR')
-                                return True, code, gateway, total_price, currency, receipt_id, order_url
+                key_result = run_gateway_keycheck(resp_json, receipt_resp_json)
+                key_status = key_result.get('status', 'UNKNOWN')
+                key_message = normalize_response_text(key_result.get('message'))
+                receipt_id = key_result.get('receipt_id') or receipt_id
+                order_url = key_result.get('order_url') or order_url
 
-                            if receipt_data.get('__typename') in ['ProcessingReceipt', 'WaitingReceipt']:
-                                await asyncio.sleep(2)
-                                continue
-                            
-                    except Exception as e:
-                        pass
-                    
-                    if 'WaitingReceipt' in final_text:
-                        await asyncio.sleep(2)
-                    else:
-                        break
-                
-                if 'CAPTCHA_REQUIRED' in final_text:
+                if key_status == 'CAPTCHA':
                     return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, receipt_id, order_url
-                
-                if 'WaitingReceipt' in final_text:
+                if key_status == 'CHARGED':
+                    return True, "ORDER_PLACED", gateway, total_price, currency, receipt_id, order_url
+                if key_status == '2FACTOR':
+                    return True, "OTP_REQUIRED", gateway, total_price, currency, receipt_id, order_url
+                if key_status == 'CCN':
+                    return True, "INCORRECT_CVC", gateway, total_price, currency, receipt_id, order_url
+                if key_status == 'NSF':
+                    return True, "INSUFFICIENT_FUNDS", gateway, total_price, currency, receipt_id, order_url
+                if key_status == 'THROTTLED':
+                    return False, "Throttled", gateway, total_price, currency, receipt_id, order_url
+                if key_status == 'RETRY':
                     return False, "Change Proxy or Site", gateway, total_price, currency, receipt_id, order_url
+                if key_status in ['DECLINED', 'EXPIRED', 'BAN', 'UNKNOWN']:
+                    return False, extract_clean_response(key_message), gateway, total_price, currency, receipt_id, order_url
+                return False, extract_clean_response(key_message), gateway, total_price, currency, receipt_id, order_url
                 
                                 
 
