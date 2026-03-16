@@ -58,6 +58,7 @@ PROGRESS_UPDATE_EVERY = int(os.getenv("PROGRESS_UPDATE_EVERY", "25"))
 PROGRESS_UPDATE_MIN_INTERVAL = float(os.getenv("PROGRESS_UPDATE_MIN_INTERVAL", "1.0"))
 MAX_PENDING_TASKS_PER_USER = int(os.getenv("MAX_PENDING_TASKS_PER_USER", "50000"))
 MAX_TOTAL_PENDING_TASKS = int(os.getenv("MAX_TOTAL_PENDING_TASKS", "250000"))
+MCHK_LAST_RESPONSE_RETRIES = int(os.getenv("MCHK_LAST_RESPONSE_RETRIES", "2"))
 
 # Logging setup
 logging.basicConfig(
@@ -533,6 +534,33 @@ def sanitize_for_log(text):
     # Redact raw proxy credentials: host:port:user:pass -> host:port:***:***
     value = re.sub(r'(\b[^:\s]+:\d{2,5}):[^:\s]+:[^:\s]+', r'\1:***:***', value)
     return value
+
+def should_retry_mchk_last_response(success, response_text):
+    """Retry only transient/unfinished mass-check failures."""
+    if success:
+        return False
+
+    response_upper = normalize_response_text(response_text).upper()
+    retry_markers = [
+        "REQUEST FAILED",
+        "FAILED TO GET SESSION TOKEN",
+        "NO DATA IN PROPOSAL RESPONSE",
+        "SESSION IS NULL",
+        "NEGOTIATE RETURNED NULL",
+        "RESULT IS NULL",
+        "EMPTY SUBMIT RESPONSE",
+        "SUBMITSUCCESS BUT NO RECEIPT",
+        "NO RECEIPT IN SUBMIT RESPONSE",
+        "NO RECEIPT ID",
+        "INVALID JSON IN SUBMIT RESPONSE",
+        "ERROR PARSING SUBMIT",
+        "CHANGE PROXY OR SITE",
+        "MAX RETRIES EXCEEDED",
+        "TIMEOUT",
+        "CONNECTION",
+        "DISCONNECTED"
+    ]
+    return any(marker in response_upper for marker in retry_markers)
 
 def parse_cc_string(cc_string):
     parts = cc_string.split('|')
@@ -1920,6 +1948,36 @@ async def task_worker(worker_id):
                 cc_data['cc'], cc_data['mes'], cc_data['ano'], cc_data['cvv'],
                 site, user_id, proxy
             )
+
+            # Extra mass-check retries when final response is missing/unfinished.
+            if task_type == 'mchk' and should_retry_mchk_last_response(success, response):
+                user_proxies = await get_user_proxies(user_id)
+                tried_proxies = set()
+                if proxy:
+                    tried_proxies.add(proxy)
+
+                for retry_idx in range(MCHK_LAST_RESPONSE_RETRIES):
+                    if not user_proxies:
+                        break
+
+                    available_proxies = [p for p in user_proxies if p not in tried_proxies]
+                    rotated_proxy = random.choice(available_proxies) if available_proxies else random.choice(user_proxies)
+                    tried_proxies.add(rotated_proxy)
+
+                    retry_reason = sanitize_for_log(normalize_response_text(response))[:180]
+                    logger.info(
+                        f"MCHK retry {retry_idx + 1}/{MCHK_LAST_RESPONSE_RETRIES} "
+                        f"for user {user_id} with rotated proxy (reason: {retry_reason})"
+                    )
+
+                    success, response, gateway, price, currency, receipt_id, order_url = await process_card(
+                        cc_data['cc'], cc_data['mes'], cc_data['ano'], cc_data['cvv'],
+                        site, user_id, rotated_proxy
+                    )
+
+                    if not should_retry_mchk_last_response(success, response):
+                        break
+
             process_time = round(time.time() - start_time, 2)
             
             # Get BIN info
