@@ -559,6 +559,28 @@ def sanitize_for_log(text):
     value = re.sub(r'(\b[^:\s]+:\d{2,5}):[^:\s]+:[^:\s]+', r'\1:***:***', value)
     return value
 
+def format_response_for_display(response_text):
+    """Format response text for clearer user-facing status codes."""
+    normalized = normalize_response_text(response_text)
+    upper = normalized.upper()
+
+    # Keep CAPTCHA format consistent as requested.
+    if "CAPTCHA_REQUIRED" in upper:
+        return '"code": "CAPTCHA_REQUIRED"'
+
+    # Try to extract structured code from JSON-like payloads.
+    code_match = re.search(r'["\']code["\']\s*:\s*["\']([^"\']+)["\']', normalized, re.IGNORECASE)
+    if code_match:
+        code_value = code_match.group(1).strip()
+        if code_value:
+            return code_value
+
+    cleaned = extract_clean_response(normalized)
+    if cleaned and cleaned != "UNKNOWN_ERROR" and ("_" in cleaned or cleaned.isupper()):
+        return cleaned
+
+    return normalized
+
 def should_retry_mchk_last_response(success, response_text):
     """Retry only transient/unfinished mass-check failures."""
     if success:
@@ -2133,8 +2155,9 @@ async def result_handler():
             except (ValueError, TypeError):
                 formatted_price = price
 
+            display_response = format_response_for_display(response)
             safe_full_cc = html.escape(str(full_cc))
-            safe_response = html.escape(str(response))
+            safe_response = html.escape(str(display_response))
             safe_bin = html.escape(str(bin_info.get('bin', 'N/A')))
             safe_brand = html.escape(str(bin_info.get('brand', 'UNKNOWN')))
             safe_type = html.escape(str(bin_info.get('type', '')))
