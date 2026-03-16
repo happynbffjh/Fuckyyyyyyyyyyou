@@ -296,6 +296,30 @@ def normalize_site_url(site_url):
         return normalized.rstrip('/')
     return f"{parsed.scheme or 'https'}://{parsed.netloc.lower()}".rstrip('/')
 
+def format_site_display_name(site_url):
+    """Format site name for user-facing messages."""
+    if not site_url:
+        return "unknown"
+
+    raw = str(site_url).strip()
+    if not raw:
+        return "unknown"
+
+    normalized = normalize_site_url(raw)
+    parsed = urlparse(normalized if normalized.startswith(("http://", "https://")) else f"https://{normalized}")
+    host = (parsed.netloc or parsed.path or raw).lower().strip()
+    host = host.split('/')[0].split('?')[0]
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host.endswith(".myshopify.com"):
+        host = host[:-len(".myshopify.com")]
+    elif host.endswith(".com"):
+        host = host[:-len(".com")]
+
+    host = host.strip(".- ")
+    return host or raw
+
 def validate_proxy_format(proxy_str):
     """Validate and normalize proxy format for storage."""
     if not proxy_str:
@@ -2074,8 +2098,8 @@ async def result_handler():
             elif response in ['CCN', 'INCORRECT_CVC', 'INSUFFICIENT_FUNDS'] or any(k in str(response) for k in ccn_keys):
                 hit_status = "live"
             
-            # Format site name - FIXED to get domain correctly
-            site_name = site.replace('https://', '').replace('http://', '').split('/')[0].split('?')[0]
+            # Format site name for compact user display.
+            site_name = format_site_display_name(site)
             
             # Format receipt with clickable order URL
             receipt_text = ""
