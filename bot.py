@@ -99,6 +99,7 @@ task_users = {}    # message_id -> user_id
 product_cache = {} # normalized_site -> {"data": product_info, "expires_at": epoch}
 bin_cache = {}     # bin -> {"data": bin_info, "expires_at": epoch}
 user_name_cache = {}  # user_id -> first_name
+user_display_cache = {}  # user_id -> @username or first_name
 mchk_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
 mchk_captcha_pref_sessions = {}  # pref_id -> {user_id, choice, event, created_at}
 user_active_mchk_batches = defaultdict(set)  # user_id -> set(batch_id)
@@ -908,6 +909,35 @@ async def get_cached_user_first_name(user_id):
         first_name = user.get('first_name', 'User') if user else 'User'
     user_name_cache[user_id] = first_name
     return first_name
+
+async def get_cached_user_display_name(user_id):
+    cached_display = user_display_cache.get(user_id)
+    if cached_display:
+        return cached_display
+
+    first_name = 'User'
+    username = None
+    if DB_AVAILABLE:
+        try:
+            user = await users_col.find_one({'user_id': user_id})
+            if user:
+                first_name = user.get('first_name', 'User')
+                username = user.get('username')
+        except Exception as e:
+            set_db_unavailable(e)
+            user = get_memory_user_doc(user_id)
+            if user:
+                first_name = user.get('first_name', 'User')
+                username = user.get('username')
+    else:
+        user = get_memory_user_doc(user_id)
+        if user:
+            first_name = user.get('first_name', 'User')
+            username = user.get('username')
+
+    display_name = f"@{username}" if username else (first_name or 'User')
+    user_display_cache[user_id] = display_name
+    return display_name
 
 async def test_site_connection(site_url, proxy_str=None):
     """Test if a site is working by trying to add to cart and get session token"""
@@ -1760,7 +1790,7 @@ async def save_working_site(user_id, site_url, product_info):
         return False, str(e)
 
 async def update_task_progress(message_id, stats, start_time=None):
-    """Update task progress message with inline status text."""
+    """Update task progress message."""
     try:
         if message_id not in task_messages:
             return
@@ -1775,19 +1805,36 @@ async def update_task_progress(message_id, stats, start_time=None):
         
         # Get user info (cached)
         user_id = task_users.get(message_id)
-        user_name = await get_cached_user_first_name(user_id) if user_id else 'User'
+        user_name = await get_cached_user_display_name(user_id) if user_id else 'User'
         
         duration_seconds = round(elapsed.total_seconds(), 1)
+        task_type = stats.get('task_type', 'mchk')
         total_cards = stats.get('total', 0)
         processed = stats.get('checked', 0)
-        otp = stats.get('otp', 0)
-        captcha = stats.get('captcha', 0)
-        live = stats.get('live', 0)
-        failed = stats.get('failed', 0)
-        dead = failed
-        hits = stats.get('hit', 0)
 
-        progress_text = f"""💳 <b>CARD PROCESSOR</b>
+        if task_type == 'chksite':
+            working_sites = stats.get('hit', 0)
+            not_working_sites = stats.get('failed', 0)
+            progress_text = f"""🌐 <b>SITE CHECKER</b>
+━━━━━━━━━━━━━━
+📂 Total Sites: {total_cards}
+📤 Processed: {processed}
+━━━━━━━━━━━━━━
+🎯 <b>RESULTS BREAKDOWN</b>
+• ✅ Working Sites: {working_sites}
+• ❌ Not Working Sites: {not_working_sites}
+━━━━━━━━━━━━━━
+⏱️ Duration: {duration_seconds}s
+👤 {user_name}"""
+            keyboard = None
+        else:
+            otp = stats.get('otp', 0)
+            captcha = stats.get('captcha', 0)
+            live = stats.get('live', 0)
+            failed = stats.get('failed', 0)
+            dead = failed
+            hits = stats.get('hit', 0)
+            progress_text = f"""💳 <b>CARD PROCESSOR</b>
 ━━━━━━━━━━━━━━
 📂 Total Cards: {total_cards}
 📤 Processed: {processed}
@@ -1803,12 +1850,12 @@ async def update_task_progress(message_id, stats, start_time=None):
 ⏱️ Duration: {duration_seconds}s
 👤 {user_name}"""
 
-        keyboard = None
-        batch_id = stats.get('batch_id')
-        if batch_id and processed < total_cards:
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
-            ]])
+            keyboard = None
+            batch_id = stats.get('batch_id')
+            if batch_id and processed < total_cards:
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")
+                ]])
         
         try:
             await message.edit_text(
@@ -1939,7 +1986,7 @@ async def result_handler():
                 RESULT_QUEUE.task_done()
                 continue
             
-            first_name = await get_cached_user_first_name(user_id)
+            first_name = await get_cached_user_display_name(user_id)
             
             # Determine hit status - FIXED VERSION
             hit_status = "failed"
@@ -2565,6 +2612,7 @@ async def get_random_site(user_id):
 async def save_user(user_id, first_name, username=None):
     """Save or update user in database"""
     user_name_cache[user_id] = first_name
+    user_display_cache[user_id] = f"@{username}" if username else (first_name or 'User')
     now_ts = utcnow()
     existing_mem = mem_users.get(user_id, {})
     mem_users[user_id] = {
@@ -2942,6 +2990,7 @@ async def mchk_command(client, message):
     batch_id = f"mchk_{user.id}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
     # Create progress message
+    user_display_name = await get_cached_user_display_name(user.id)
     progress_text = f"""💳 <b>CARD PROCESSOR</b>
 ━━━━━━━━━━━━━━
 📂 Total Cards: {len(accepted_cards)}
@@ -2956,7 +3005,7 @@ async def mchk_command(client, message):
 • 🚫 Failed: 0
 ━━━━━━━━━━━━━━
 ⏱️ Duration: 0.0s
-👤 {user.first_name}"""
+👤 {user_display_name}"""
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏹️ Stop", callback_data=f"stopmchk_batch:{batch_id}")]
@@ -3172,31 +3221,21 @@ async def chksite_command(client, message):
     proxy = random.choice(user_proxies) if user_proxies else None
     
     # Create progress message
-    progress_text = f"""TASK
-USER: {user.first_name}
-START TIME: {datetime.now().strftime('%H:%M:%S')}
-ELAPSED: 0:00:00
-
-CREATED BY @still_alivenow"""
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"TOTAL {len(sites)}", callback_data="ignore"),
-            InlineKeyboardButton(f"CHECKED 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton(f"HIT 0", callback_data="ignore"),
-            InlineKeyboardButton(f"LIVE 0", callback_data="ignore")
-        ],
-        [
-            InlineKeyboardButton(f"3DS 0", callback_data="ignore"),
-            InlineKeyboardButton(f"FAILED 0", callback_data="ignore")
-        ]
-    ])
+    user_display_name = await get_cached_user_display_name(user.id)
+    progress_text = f"""🌐 <b>SITE CHECKER</b>
+━━━━━━━━━━━━━━
+📂 Total Sites: {len(sites)}
+📤 Processed: 0
+━━━━━━━━━━━━━━
+🎯 <b>RESULTS BREAKDOWN</b>
+• ✅ Working Sites: 0
+• ❌ Not Working Sites: 0
+━━━━━━━━━━━━━━
+⏱️ Duration: 0.0s
+👤 {user_display_name}"""
     
     processing_msg = await message.reply_text(
         text=progress_text,
-        reply_markup=keyboard,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
     )
@@ -3283,15 +3322,15 @@ CREATED BY @still_alivenow"""
             await f.write(f"{site} - {error}\n")
     
     # Send results
+    not_working_total = len(skipped_sites) + len(dead_sites)
     summary = f"""✅ Site Test Complete!
 
 📊 Results:
-🟢 Added: {len(working_sites)}
-🟡 Skipped (outside ${MIN_SITE_PRODUCT_PRICE:.2f}-${MAX_SITE_PRODUCT_PRICE:.2f}): {len(skipped_sites)}
-🔴 Dead: {len(dead_sites)}
+🟢 Working Sites: {len(working_sites)}
+🔴 Not Working Sites: {not_working_total}
 
-Only sites between ${MIN_SITE_PRODUCT_PRICE:.2f} and ${MAX_SITE_PRODUCT_PRICE:.2f} were added.
-Check /showsites to see them."""
+Only sites between ${MIN_SITE_PRODUCT_PRICE:.2f} and ${MAX_SITE_PRODUCT_PRICE:.2f} are saved.
+Check /showsites to see saved working sites."""
     
     await message.reply_document(
         result_file,
