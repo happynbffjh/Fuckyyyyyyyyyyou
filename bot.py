@@ -42,8 +42,8 @@ HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
 # Constants
 MAX_SITES_PER_USER = 500
 MAX_GLOBAL_SITES = 500
-MIN_SITE_PRODUCT_PRICE = 1.00
-MAX_SITE_PRODUCT_PRICE = 26.00
+MIN_SITE_PRODUCT_PRICE = 0.00
+MAX_SITE_PRODUCT_PRICE = 18.00
 WORKER_COUNT = min(int(os.getenv("WORKER_COUNT", "25")), 25)
 PROXY_VALIDATION_URL = "https://httpbin.org/ip"
 PROXY_VALIDATION_TIMEOUT = 6
@@ -821,7 +821,7 @@ def filter_sites_by_price_range(sites):
             removed += 1
             continue
 
-        if price < MIN_SITE_PRODUCT_PRICE or price > MAX_SITE_PRODUCT_PRICE:
+        if price > MAX_SITE_PRODUCT_PRICE:
             removed += 1
             continue
 
@@ -1845,9 +1845,6 @@ async def save_working_site(user_id, site_url, product_info):
             product_price = float(str(product_info.get('price', '0')).replace(',', '').strip())
         except Exception:
             return False, "Invalid product price"
-
-        if product_price < MIN_SITE_PRODUCT_PRICE:
-            return False, f"Cheapest product ${product_price:.2f} is below ${MIN_SITE_PRODUCT_PRICE:.2f}"
 
         if product_price > MAX_SITE_PRODUCT_PRICE:
             return False, f"Cheapest product ${product_price:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
@@ -3438,10 +3435,6 @@ async def chksite_command(client, message):
                 except Exception:
                     return "skipped", site_to_check, product_info, "Invalid product price"
 
-                if p < MIN_SITE_PRODUCT_PRICE:
-                    return "skipped", site_to_check, product_info, (
-                        f"Cheapest product ${p:.2f} is below ${MIN_SITE_PRODUCT_PRICE:.2f}"
-                    )
                 if p > MAX_SITE_PRODUCT_PRICE:
                     return "skipped", site_to_check, product_info, (
                         f"Cheapest product ${p:.2f} is above ${MAX_SITE_PRODUCT_PRICE:.2f}"
@@ -3506,7 +3499,7 @@ async def chksite_command(client, message):
 🟢 Working Sites: {len(working_sites)}
 🔴 Not Working Sites: {not_working_total}
 
-Only sites between ${MIN_SITE_PRODUCT_PRICE:.2f} and ${MAX_SITE_PRODUCT_PRICE:.2f} are saved.
+Only sites priced up to ${MAX_SITE_PRODUCT_PRICE:.2f} are saved.
 Check /showsites to see saved working sites."""
     
     await message.reply_document(
